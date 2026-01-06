@@ -110,13 +110,13 @@ class BaoStockProvider:
             parts.append(df)
         if not parts:
             return pd.DataFrame()
-            df_all = pd.concat(parts, ignore_index=True)
-            df_all = df_all.rename(columns={"date": "trade_date", "code": "ts_code", "volume": "vol"})
-            df_all["trade_date"] = df_all["trade_date"].astype(str).map(_iso_to_yyyymmdd)
-            df_all["ts_code"] = df_all["ts_code"].astype(str).map(bs_to_ts_code)
-            for col in ["open", "high", "low", "close", "vol", "amount"]:
-                df_all[col] = pd.to_numeric(df_all[col], errors="coerce")
-            return df_all[["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"]]
+        df_all = pd.concat(parts, ignore_index=True)
+        df_all = df_all.rename(columns={"date": "trade_date", "code": "ts_code", "volume": "vol"})
+        df_all["trade_date"] = df_all["trade_date"].astype(str).map(_iso_to_yyyymmdd)
+        df_all["ts_code"] = df_all["ts_code"].astype(str).map(bs_to_ts_code)
+        for col in ["open", "high", "low", "close", "vol", "amount"]:
+            df_all[col] = pd.to_numeric(df_all[col], errors="coerce")
+        return df_all[["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"]]
 
     def fetch_daily_ranges(self, *, bs_code: str, ranges: Iterable[tuple[str, str]]) -> pd.DataFrame:
         with self.session() as bs:
