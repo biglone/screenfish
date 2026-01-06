@@ -51,8 +51,15 @@ stock_screener update --start 20240101 --end 20240131
 
 参数：
 - `--provider baostock|tushare`：数据源（默认 `baostock`）
+- `--repair-days 30`：不传 `--start` 时生效，自动向前回看 N 个自然日修补缺口并更新到今天
 - `--cache ./data`：缓存目录
 - `--data-backend sqlite`：当前仅实现 SQLite（默认）
+
+只拉取最新并自动修补最近缺口（推荐日常用法）：
+
+```bash
+stock_screener update
+```
 
 示例（TuShare Pro）：
 

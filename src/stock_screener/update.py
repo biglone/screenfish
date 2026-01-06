@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import date as _date
+
 import typer
 
 from stock_screener.backends.sqlite_backend import SqliteBackend
 from stock_screener.config import Settings
-from stock_screener.dates import parse_yyyymmdd
+from stock_screener.dates import format_yyyymmdd, parse_yyyymmdd, subtract_calendar_days
 from stock_screener.providers import get_provider
 from stock_screener.providers.baostock_provider import BaoStockNotConfigured
 from stock_screener.providers.baostock_provider import bs_to_ts_code
@@ -18,18 +20,46 @@ def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     return [values[i : i + batch_size] for i in range(0, len(values), batch_size)]
 
 
-def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> None:
+def _resolve_start_end(
+    *,
+    backend: SqliteBackend,
+    start: str | None,
+    end: str | None,
+    repair_days: int,
+) -> tuple[str, str]:
+    end_eff = end or format_yyyymmdd(_date.today())
+    parse_yyyymmdd(end_eff)
+
+    if start is not None:
+        parse_yyyymmdd(start)
+        if parse_yyyymmdd(start) > parse_yyyymmdd(end_eff):
+            raise typer.BadParameter("start must be <= end")
+        return start, end_eff
+
+    # Auto mode: choose a recent lookback window to both fetch "latest" and repair gaps.
+    last = backend.max_trade_date_in_update_log() or backend.max_trade_date_in_daily()
+    if not last:
+        raise typer.BadParameter("no local cache found; please specify --start for the first update")
+    parse_yyyymmdd(last)
+    if repair_days < 0:
+        raise typer.BadParameter("repair-days must be >= 0")
+    start_eff = subtract_calendar_days(last, repair_days)
+    if parse_yyyymmdd(start_eff) > parse_yyyymmdd(end_eff):
+        start_eff = end_eff
+    return start_eff, end_eff
+
+
+def update_daily(*, settings: Settings, start: str | None, end: str | None, provider: str, repair_days: int) -> None:
     if settings.data_backend != "sqlite":
         raise typer.BadParameter("only sqlite backend is implemented")
-    if parse_yyyymmdd(start) > parse_yyyymmdd(end):
-        raise typer.BadParameter("start must be <= end")
 
     backend = SqliteBackend(settings.sqlite_path)
     backend.init()
+    start_eff, end_eff = _resolve_start_end(backend=backend, start=start, end=end, repair_days=repair_days)
 
     try:
         p = get_provider(provider)
-        open_dates = p.open_trade_dates(start=start, end=end)
+        open_dates = p.open_trade_dates(start=start_eff, end=end_eff)
     except (TuShareNotConfigured, BaoStockNotConfigured) as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(code=2) from e
@@ -38,7 +68,7 @@ def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> 
 
     updated = backend.get_updated_trade_dates(open_dates)
     missing = [d for d in open_dates if d not in updated]
-    typer.echo(f"open trade dates: {len(open_dates)}, missing: {len(missing)}")
+    typer.echo(f"range: {start_eff}..{end_eff}, open trade dates: {len(open_dates)}, missing: {len(missing)}")
 
     if getattr(p, "name", "") == "tushare":
         with backend.connect() as conn:

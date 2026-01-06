@@ -17,14 +17,15 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 @app.command()
 def update(
-    start: str = typer.Option(..., help="Start date YYYYMMDD"),
-    end: str = typer.Option(..., help="End date YYYYMMDD"),
+    start: Optional[str] = typer.Option(None, help="Start date YYYYMMDD (optional; auto if omitted)"),
+    end: Optional[str] = typer.Option(None, help="End date YYYYMMDD (optional; defaults to today)"),
     provider: str = typer.Option("baostock", help="baostock|tushare"),
+    repair_days: int = typer.Option(30, help="Auto mode lookback calendar days to repair gaps"),
     data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
 ) -> None:
     settings = Settings(cache_dir=cache, data_backend=data_backend)
-    update_daily(settings=settings, start=start, end=end, provider=provider)
+    update_daily(settings=settings, start=start, end=end, provider=provider, repair_days=repair_days)
 
 
 @app.command("sync-names")

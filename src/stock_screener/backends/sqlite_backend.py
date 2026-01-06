@@ -194,6 +194,20 @@ class SqliteBackend:
             out[str(r["ts_code"])] = str(r["name"])
         return out
 
+    def max_trade_date_in_daily(self) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT MAX(trade_date) AS d FROM daily").fetchone()
+        if not row:
+            return None
+        return row["d"]
+
+    def max_trade_date_in_update_log(self) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT MAX(trade_date) AS d FROM update_log").fetchone()
+        if not row:
+            return None
+        return row["d"]
+
     def mark_progress_ts_code_in_conn(
         self,
         conn: sqlite3.Connection,
