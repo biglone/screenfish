@@ -7,6 +7,7 @@ from datetime import date as _date
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from stock_screener.backends.sqlite_backend import SqliteBackend
@@ -97,6 +98,17 @@ def create_app(*, settings: Settings) -> FastAPI:
     app = FastAPI(title="stock_screener", version="0.1.0")
     state = AppState(settings=settings)
     app.state.app_state = state
+
+    origins_env = os.environ.get("STOCK_SCREENER_CORS_ORIGINS", "").strip()
+    if origins_env:
+        origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     def _settings_dep() -> Settings:
         return app.state.app_state.settings
@@ -286,3 +298,20 @@ def create_app(*, settings: Settings) -> FastAPI:
         return {"trade_date": date_value, "ebk": content}
 
     return app
+
+
+def create_app_from_env() -> FastAPI:
+    """
+    Uvicorn factory entrypoint.
+
+    Env:
+      - STOCK_SCREENER_CACHE_DIR: default ./data
+      - STOCK_SCREENER_DATA_BACKEND: default sqlite
+      - STOCK_SCREENER_API_KEY: optional (require X-API-Key)
+      - STOCK_SCREENER_CORS_ORIGINS: optional comma-separated origins
+    """
+
+    cache_dir = os.environ.get("STOCK_SCREENER_CACHE_DIR", "./data")
+    data_backend = os.environ.get("STOCK_SCREENER_DATA_BACKEND", "sqlite")
+    settings = Settings(cache_dir=cache_dir, data_backend=data_backend)  # type: ignore[arg-type]
+    return create_app(settings=settings)

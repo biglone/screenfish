@@ -1,0 +1,19 @@
+[Unit]
+Description=stock_screener API service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stock_screener
+Environment=STOCK_SCREENER_CACHE_DIR=/opt/stock_screener/data
+Environment=STOCK_SCREENER_DATA_BACKEND=sqlite
+# Environment=STOCK_SCREENER_API_KEY=change-me
+# Environment=STOCK_SCREENER_CORS_ORIGINS=https://your-domain.com
+# Environment=TUSHARE_TOKEN=...
+ExecStart=/opt/stock_screener/.venv/bin/uvicorn stock_screener.server:create_app_from_env --factory --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+

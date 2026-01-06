@@ -1,0 +1,27 @@
+services:
+  stock_screener:
+    build: .
+    container_name: stock_screener
+    restart: unless-stopped
+    environment:
+      STOCK_SCREENER_CACHE_DIR: /data
+      STOCK_SCREENER_DATA_BACKEND: sqlite
+      # STOCK_SCREENER_API_KEY: "change-me"
+      # STOCK_SCREENER_CORS_ORIGINS: "https://your-domain.com,https://app.your-domain.com"
+      # TUSHARE_TOKEN: ""
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  # Optional: expose via Cloudflare Tunnel without opening firewall ports.
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: stock_screener_cloudflared
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - stock_screener
+  #   command: tunnel run --token ${CLOUDFLARED_TOKEN}
+  #   environment:
+  #     CLOUDFLARED_TOKEN: ""
+

@@ -162,6 +162,11 @@ stock_screener serve --cache ./data
 API 文档（OpenAPI）：
 - `http://127.0.0.1:8000/docs`
 
+公网部署建议：
+- 推荐用 Cloudflare Tunnel 暴露域名（见 `deploy/cloudflared/README.md`），服务只监听本机 `127.0.0.1:8000`。
+- 不建议裸奔公网：至少设置 `STOCK_SCREENER_API_KEY`（请求头 `X-API-Key`），并在 Cloudflare 上加 WAF/限流。
+- Web 端访问需要配置 CORS：`STOCK_SCREENER_CORS_ORIGINS=https://your-domain.com,https://app.your-domain.com`
+
 可选鉴权（如果设置了环境变量则必须带请求头）：
 - `export STOCK_SCREENER_API_KEY="your-key"`
 - 请求头：`X-API-Key: your-key`
