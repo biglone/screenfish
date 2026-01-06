@@ -83,6 +83,70 @@ class AvailabilityResponse(BaseModel):
     detail: str
 
 
+class StockItem(BaseModel):
+    ts_code: str
+    name: str | None = None
+
+
+class StockListResponse(BaseModel):
+    total: int
+    stocks: list[StockItem]
+
+
+class DailyBar(BaseModel):
+    trade_date: str
+    open: float
+    high: float
+    low: float
+    close: float
+    vol: float
+    amount: float
+
+
+class StockDailyResponse(BaseModel):
+    ts_code: str
+    name: str | None = None
+    bars: list[DailyBar]
+
+
+class FormulaItem(BaseModel):
+    id: int
+    name: str
+    formula: str
+    description: str | None = None
+    enabled: bool = True
+    created_at: str
+    updated_at: str
+
+
+class FormulaListResponse(BaseModel):
+    total: int
+    formulas: list[FormulaItem]
+
+
+class FormulaCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    formula: str = Field(..., min_length=1)
+    description: str | None = None
+    enabled: bool = True
+
+
+class FormulaUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    formula: str | None = Field(default=None, min_length=1)
+    description: str | None = None
+    enabled: bool | None = None
+
+
+class FormulaValidateRequest(BaseModel):
+    formula: str
+
+
+class FormulaValidateResponse(BaseModel):
+    valid: bool
+    message: str
+
+
 @dataclass(frozen=True)
 class AppState:
     settings: Settings
@@ -296,6 +360,250 @@ def create_app(*, settings: Settings) -> FastAPI:
         fmt = TdxEbkFormat()
         content = ("\r\n" if fmt.leading_crlf else "") + "\r\n".join(ebk_codes) + ("\r\n" if fmt.trailing_crlf else "")
         return {"trade_date": date_value, "ebk": content}
+
+    @app.get("/v1/stocks", response_model=StockListResponse, dependencies=[Depends(_api_key_required)])
+    def list_stocks(
+        search: str | None = Query(default=None, description="Search by ts_code or name"),
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        settings: Settings = Depends(_settings_dep),
+    ) -> StockListResponse:
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(settings.sqlite_path))
+        conn.row_factory = _sqlite3.Row
+        try:
+            cur = conn.cursor()
+            if search:
+                search_pattern = f"%{search}%"
+                cur.execute(
+                    """
+                    SELECT DISTINCT d.ts_code, sb.name
+                    FROM daily d
+                    LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
+                    WHERE d.ts_code LIKE ? OR sb.name LIKE ?
+                    ORDER BY d.ts_code
+                    LIMIT ? OFFSET ?
+                    """,
+                    (search_pattern, search_pattern, limit, offset),
+                )
+                stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT d.ts_code) as cnt
+                    FROM daily d
+                    LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
+                    WHERE d.ts_code LIKE ? OR sb.name LIKE ?
+                    """,
+                    (search_pattern, search_pattern),
+                )
+                total = cur.fetchone()["cnt"]
+            else:
+                cur.execute(
+                    """
+                    SELECT DISTINCT d.ts_code, sb.name
+                    FROM daily d
+                    LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
+                    ORDER BY d.ts_code
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                )
+                stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
+                cur.execute("SELECT COUNT(DISTINCT ts_code) as cnt FROM daily")
+                total = cur.fetchone()["cnt"]
+        finally:
+            conn.close()
+        return StockListResponse(total=total, stocks=stocks)
+
+    @app.get("/v1/stocks/{ts_code}/daily", response_model=StockDailyResponse, dependencies=[Depends(_api_key_required)])
+    def get_stock_daily(
+        ts_code: str,
+        start: str | None = Query(default=None, description="Start date YYYYMMDD"),
+        end: str | None = Query(default=None, description="End date YYYYMMDD"),
+        limit: int = Query(default=250, ge=1, le=1000),
+        settings: Settings = Depends(_settings_dep),
+    ) -> StockDailyResponse:
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(settings.sqlite_path))
+        conn.row_factory = _sqlite3.Row
+        try:
+            cur = conn.cursor()
+            # Get stock name
+            cur.execute("SELECT name FROM stock_basic WHERE ts_code = ?", (ts_code,))
+            name_row = cur.fetchone()
+            name = name_row["name"] if name_row else None
+
+            # Build query for daily bars
+            query = "SELECT trade_date, open, high, low, close, vol, amount FROM daily WHERE ts_code = ?"
+            params: list[Any] = [ts_code]
+            if start:
+                query += " AND trade_date >= ?"
+                params.append(start)
+            if end:
+                query += " AND trade_date <= ?"
+                params.append(end)
+            query += " ORDER BY trade_date DESC LIMIT ?"
+            params.append(limit)
+
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            bars = [
+                DailyBar(
+                    trade_date=row["trade_date"],
+                    open=row["open"],
+                    high=row["high"],
+                    low=row["low"],
+                    close=row["close"],
+                    vol=row["vol"],
+                    amount=row["amount"],
+                )
+                for row in reversed(rows)  # Return in ascending order
+            ]
+        finally:
+            conn.close()
+
+        if not bars:
+            raise HTTPException(status_code=404, detail=f"No data found for {ts_code}")
+
+        return StockDailyResponse(ts_code=ts_code, name=name, bars=bars)
+
+    @app.post("/v1/sync-stock-names", dependencies=[Depends(_api_key_required)])
+    def sync_stock_names(settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
+        """Sync stock names from baostock."""
+        from stock_screener.providers.baostock_provider import BaoStockProvider
+
+        backend = _backend(settings)
+        max_date = backend.max_trade_date_in_daily()
+        if not max_date:
+            raise HTTPException(status_code=400, detail="no local data; run update first")
+
+        provider = BaoStockProvider()
+        with provider.session() as bs:
+            basics_df = provider._all_stock_basics(bs=bs, day=max_date)
+            if basics_df.empty:
+                return {"ok": False, "synced": 0, "message": "no stock basics returned"}
+            backend.upsert_stock_basic_df(basics_df)
+            return {"ok": True, "synced": len(basics_df), "message": f"synced {len(basics_df)} stock names"}
+
+    # Formula CRUD endpoints
+
+    @app.get("/v1/formulas", response_model=FormulaListResponse, dependencies=[Depends(_api_key_required)])
+    def list_formulas(
+        enabled_only: bool = Query(default=False, description="Only return enabled formulas"),
+        settings: Settings = Depends(_settings_dep),
+    ) -> FormulaListResponse:
+        """List all formulas."""
+        backend = _backend(settings)
+        formulas = backend.list_formulas(enabled_only=enabled_only)
+        return FormulaListResponse(
+            total=len(formulas),
+            formulas=[FormulaItem(**f) for f in formulas],
+        )
+
+    @app.post("/v1/formulas", response_model=FormulaItem, dependencies=[Depends(_api_key_required)])
+    def create_formula(
+        req: FormulaCreate,
+        settings: Settings = Depends(_settings_dep),
+    ) -> FormulaItem:
+        """Create a new formula."""
+        from stock_screener.formula_parser import validate_formula
+
+        # Validate formula syntax first
+        valid, msg = validate_formula(req.formula)
+        if not valid:
+            raise HTTPException(status_code=400, detail=f"Invalid formula syntax: {msg}")
+
+        backend = _backend(settings)
+        # Check if name already exists
+        existing = backend.get_formula_by_name(req.name)
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Formula with name '{req.name}' already exists")
+
+        try:
+            formula = backend.create_formula(
+                name=req.name,
+                formula=req.formula,
+                description=req.description,
+                enabled=req.enabled,
+            )
+            return FormulaItem(**formula)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    @app.get("/v1/formulas/{formula_id}", response_model=FormulaItem, dependencies=[Depends(_api_key_required)])
+    def get_formula(
+        formula_id: int,
+        settings: Settings = Depends(_settings_dep),
+    ) -> FormulaItem:
+        """Get a formula by ID."""
+        backend = _backend(settings)
+        formula = backend.get_formula(formula_id)
+        if not formula:
+            raise HTTPException(status_code=404, detail=f"Formula {formula_id} not found")
+        return FormulaItem(**formula)
+
+    @app.put("/v1/formulas/{formula_id}", response_model=FormulaItem, dependencies=[Depends(_api_key_required)])
+    def update_formula(
+        formula_id: int,
+        req: FormulaUpdate,
+        settings: Settings = Depends(_settings_dep),
+    ) -> FormulaItem:
+        """Update a formula."""
+        from stock_screener.formula_parser import validate_formula
+
+        backend = _backend(settings)
+
+        # Check formula exists
+        existing = backend.get_formula(formula_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"Formula {formula_id} not found")
+
+        # Validate formula syntax if provided
+        if req.formula is not None:
+            valid, msg = validate_formula(req.formula)
+            if not valid:
+                raise HTTPException(status_code=400, detail=f"Invalid formula syntax: {msg}")
+
+        # Check name uniqueness if changing name
+        if req.name is not None and req.name != existing["name"]:
+            name_conflict = backend.get_formula_by_name(req.name)
+            if name_conflict:
+                raise HTTPException(status_code=409, detail=f"Formula with name '{req.name}' already exists")
+
+        try:
+            formula = backend.update_formula(
+                formula_id,
+                name=req.name,
+                formula=req.formula,
+                description=req.description,
+                enabled=req.enabled,
+            )
+            return FormulaItem(**formula)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+    @app.delete("/v1/formulas/{formula_id}", dependencies=[Depends(_api_key_required)])
+    def delete_formula(
+        formula_id: int,
+        settings: Settings = Depends(_settings_dep),
+    ) -> dict[str, Any]:
+        """Delete a formula."""
+        backend = _backend(settings)
+        if not backend.delete_formula(formula_id):
+            raise HTTPException(status_code=404, detail=f"Formula {formula_id} not found")
+        return {"ok": True, "deleted": formula_id}
+
+    @app.post("/v1/formulas/validate", response_model=FormulaValidateResponse, dependencies=[Depends(_api_key_required)])
+    def validate_formula_endpoint(
+        req: FormulaValidateRequest,
+    ) -> FormulaValidateResponse:
+        """Validate formula syntax without saving."""
+        from stock_screener.formula_parser import validate_formula
+
+        valid, msg = validate_formula(req.formula)
+        return FormulaValidateResponse(valid=valid, message=msg)
 
     return app
 

@@ -53,6 +53,16 @@ class SqliteBackend:
                   updated_at TEXT NOT NULL,
                   PRIMARY KEY (provider, range_start, range_end, ts_code)
                 );
+
+                CREATE TABLE IF NOT EXISTS formulas (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT NOT NULL UNIQUE,
+                  formula TEXT NOT NULL,
+                  description TEXT,
+                  enabled INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -255,3 +265,141 @@ class SqliteBackend:
                 (start, end),
             ).fetchall()
         return {row["ts_code"] for row in rows}
+
+    # Formula CRUD methods
+
+    def create_formula(
+        self,
+        *,
+        name: str,
+        formula: str,
+        description: str | None = None,
+        enabled: bool = True,
+    ) -> dict:
+        """创建新公式"""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO formulas (name, formula, description, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (name, formula, description, 1 if enabled else 0, now, now),
+            )
+            formula_id = cursor.lastrowid
+        return self.get_formula(formula_id)
+
+    def get_formula(self, formula_id: int) -> dict | None:
+        """获取单个公式"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM formulas WHERE id = ?",
+                (formula_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "formula": row["formula"],
+            "description": row["description"],
+            "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_formula_by_name(self, name: str) -> dict | None:
+        """根据名称获取公式"""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM formulas WHERE name = ?",
+                (name,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "formula": row["formula"],
+            "description": row["description"],
+            "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_formulas(self, *, enabled_only: bool = False) -> list[dict]:
+        """列出所有公式"""
+        with self.connect() as conn:
+            if enabled_only:
+                rows = conn.execute(
+                    "SELECT * FROM formulas WHERE enabled = 1 ORDER BY id ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM formulas ORDER BY id ASC"
+                ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "formula": row["formula"],
+                "description": row["description"],
+                "enabled": bool(row["enabled"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def update_formula(
+        self,
+        formula_id: int,
+        *,
+        name: str | None = None,
+        formula: str | None = None,
+        description: str | None = None,
+        enabled: bool | None = None,
+    ) -> dict | None:
+        """更新公式"""
+        existing = self.get_formula(formula_id)
+        if not existing:
+            return None
+
+        updates = []
+        params = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if formula is not None:
+            updates.append("formula = ?")
+            params.append(formula)
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+        if enabled is not None:
+            updates.append("enabled = ?")
+            params.append(1 if enabled else 0)
+
+        if not updates:
+            return existing
+
+        now = datetime.now(timezone.utc).isoformat()
+        updates.append("updated_at = ?")
+        params.append(now)
+        params.append(formula_id)
+
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE formulas SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+        return self.get_formula(formula_id)
+
+    def delete_formula(self, formula_id: int) -> bool:
+        """删除公式"""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM formulas WHERE id = ?",
+                (formula_id,),
+            )
+        return cursor.rowcount > 0

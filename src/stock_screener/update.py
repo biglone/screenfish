@@ -85,7 +85,22 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
         return
 
     if getattr(p, "name", "") == "baostock":
+        # Always sync stock names when using baostock
+        def _sync_stock_names(bs, day: str) -> None:
+            try:
+                basics_df = p._all_stock_basics(bs=bs, day=day)
+                if not basics_df.empty:
+                    backend.upsert_stock_basic_df(basics_df)
+                    typer.echo(f"synced {len(basics_df)} stock names")
+            except Exception as e:
+                typer.echo(f"warning: failed to sync stock names: {e}", err=True)
+
         if not missing:
+            # No daily data to update, but still sync stock names
+            max_date = backend.max_trade_date_in_daily()
+            if max_date:
+                with p.session() as bs:
+                    _sync_stock_names(bs, max_date)
             typer.echo("done")
             return
 
@@ -103,6 +118,9 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
             if not codes:
                 typer.echo(f"error: empty stock list; cannot update {range_start}..{range_end}", err=True)
                 raise typer.Exit(code=2)
+
+            # Sync stock names
+            _sync_stock_names(bs, range_end)
 
         provider_name = "baostock"
         target_ts_codes = {bs_to_ts_code(c) for c in codes}

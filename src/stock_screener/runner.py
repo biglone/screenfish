@@ -53,7 +53,7 @@ def run_screen(
     df = df.sort_values(["ts_code", "trade_date"], kind="mergesort").reset_index(drop=True)
 
     try:
-        rule_objs = resolve_rules(rules)
+        rule_objs = resolve_rules(rules, backend=backend)
     except ValueError as e:
         raise typer.BadParameter(str(e)) from e
     masks: dict[str, pd.Series] = {}
