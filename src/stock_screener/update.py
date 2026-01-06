@@ -66,11 +66,24 @@ def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> 
         with p.session() as bs:
             codes = p._all_stock_codes(bs=bs, day=end)
             provider_name = "baostock"
+            target_ts_codes = {bs_to_ts_code(c) for c in codes}
+
             done = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
             if not done:
-                done = backend.distinct_ts_codes_in_range(start=range_start, end=range_end)
+                seed = backend.distinct_ts_codes_in_range(start=range_start, end=range_end)
+                if seed:
+                    with backend.connect() as conn:
+                        for ts_code in seed:
+                            backend.mark_progress_ts_code_in_conn(
+                                conn,
+                                provider=provider_name,
+                                range_start=range_start,
+                                range_end=range_end,
+                                ts_code=ts_code,
+                            )
+                    done = set(seed)
             typer.echo(
-                f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done)}"
+                f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done & target_ts_codes)}"
             )
 
             batches = _batched(codes, batch_size=200)
@@ -81,7 +94,11 @@ def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> 
                         ts_code = bs_to_ts_code(code)
                         if ts_code in done:
                             continue
-                        df = p._fetch_daily_ranges(bs=bs, bs_code=code, ranges=ranges)
+                        try:
+                            df = p._fetch_daily_ranges(bs=bs, bs_code=code, ranges=ranges)
+                        except RuntimeError as e:
+                            typer.echo(f"warning: {code} failed: {e}", err=True)
+                            continue
                         if df.empty:
                             backend.mark_progress_ts_code_in_conn(
                                 conn,
@@ -100,6 +117,12 @@ def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> 
                             ts_code=ts_code,
                         )
                         done.add(ts_code)
+
+            progress = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
+            completed = len(progress & target_ts_codes)
+            if completed < len(target_ts_codes):
+                typer.echo(f"incomplete: completed {completed}/{len(target_ts_codes)} stocks; rerun to resume", err=True)
+                raise typer.Exit(code=1)
 
             with backend.connect() as conn:
                 for d in missing_sorted:

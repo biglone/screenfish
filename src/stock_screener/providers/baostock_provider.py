@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import time
 from typing import Iterable
 
 import pandas as pd
@@ -89,26 +90,40 @@ class BaoStockProvider:
             return self._all_stock_codes(bs=bs, day=day)
 
     def _fetch_daily_ranges(self, *, bs, bs_code: str, ranges: Iterable[tuple[str, str]]) -> pd.DataFrame:
-        parts: list[pd.DataFrame] = []
-        for start, end in ranges:
-            rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,code,open,high,low,close,volume,amount",
-                start_date=_to_iso(start),
-                end_date=_to_iso(end),
-                frequency="d",
-                adjustflag="3",
-            )
-            if rs.error_code != "0":  # pragma: no cover
-                raise RuntimeError(f"baostock query_history_k_data_plus failed: {rs.error_msg}")
-            rows = []
-            while rs.next():
-                rows.append(rs.get_row_data())
-            if not rows:
-                continue
-            df = pd.DataFrame(rows, columns=rs.fields)
-            parts.append(df)
+        last_err: str | None = None
+        for attempt in range(3):
+            parts: list[pd.DataFrame] = []
+            last_err = None
+            for start, end in ranges:
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,code,open,high,low,close,volume,amount",
+                    start_date=_to_iso(start),
+                    end_date=_to_iso(end),
+                    frequency="d",
+                    adjustflag="3",
+                )
+                if rs is None:  # pragma: no cover
+                    last_err = "baostock returned None resultset"
+                    parts = []
+                    break
+                if rs.error_code != "0":
+                    last_err = str(getattr(rs, "error_msg", "") or "unknown error")
+                    parts = []
+                    break
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    continue
+                df = pd.DataFrame(rows, columns=rs.fields)
+                parts.append(df)
+            if last_err is None:
+                break
+            time.sleep(1.0 * (2**attempt))
         if not parts:
+            if last_err:
+                raise RuntimeError(f"baostock query_history_k_data_plus failed: {last_err}")
             return pd.DataFrame()
         df_all = pd.concat(parts, ignore_index=True)
         df_all = df_all.rename(columns={"date": "trade_date", "code": "ts_code", "volume": "vol"})
