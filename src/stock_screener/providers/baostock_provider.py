@@ -44,6 +44,22 @@ class BaoStockProvider:
             raise BaoStockNotConfigured("baostock is not installed; run: pip install baostock") from e
         return bs
 
+    def _relogin_if_needed(self, *, bs, err_msg: str | None) -> None:
+        if not err_msg:
+            return
+        # BaoStock sometimes drops the session and returns "用户未登录".
+        if "用户未登录" not in err_msg and "尚未登录" not in err_msg:
+            return
+        try:
+            if hasattr(bs, "logout"):
+                bs.logout()
+        except Exception:
+            # Best-effort; we'll try login anyway.
+            pass
+        lg = bs.login()
+        if getattr(lg, "error_code", "0") != "0":  # pragma: no cover
+            raise RuntimeError(f"baostock relogin failed: {getattr(lg, 'error_msg', '')}")
+
     @contextmanager
     def session(self):
         bs = self._bs()
@@ -74,15 +90,20 @@ class BaoStockProvider:
             return self._open_trade_dates(bs=bs, start=start, end=end)
 
     def _all_stock_codes(self, *, bs, day: str) -> list[str]:
-        rs = bs.query_all_stock(day=_to_iso(day))
+        # Use stock_basic so we only pull A-share stocks (type=1), including delisted ones.
+        # query_all_stock(day=...) contains ETFs/indices and misses delisted stocks.
+        rs = bs.query_stock_basic()
         if rs.error_code != "0":  # pragma: no cover
-            raise RuntimeError(f"baostock query_all_stock failed: {rs.error_msg}")
+            raise RuntimeError(f"baostock query_stock_basic failed: {rs.error_msg}")
         codes = []
         while rs.next():
             row = rs.get_row_data()
-            if not row:
+            if not row or len(row) < 6:
                 continue
-            codes.append(row[0])
+            code, _name, _ipo, _out, typ, _status = row[:6]
+            if str(typ) != "1":
+                continue
+            codes.append(str(code))
         return codes
 
     def _all_stock_basics(self, *, bs, day: str) -> pd.DataFrame:
@@ -120,9 +141,10 @@ class BaoStockProvider:
 
     def _fetch_daily_ranges(self, *, bs, bs_code: str, ranges: Iterable[tuple[str, str]]) -> pd.DataFrame:
         last_err: str | None = None
-        for attempt in range(3):
+        for attempt in range(5):
             parts: list[pd.DataFrame] = []
             last_err = None
+            need_retry = False
             for start, end in ranges:
                 rs = bs.query_history_k_data_plus(
                     bs_code,
@@ -135,10 +157,13 @@ class BaoStockProvider:
                 if rs is None:  # pragma: no cover
                     last_err = "baostock returned None resultset"
                     parts = []
+                    need_retry = True
                     break
                 if rs.error_code != "0":
                     last_err = str(getattr(rs, "error_msg", "") or "unknown error")
+                    self._relogin_if_needed(bs=bs, err_msg=last_err)
                     parts = []
+                    need_retry = True
                     break
                 rows = []
                 while rs.next():
@@ -147,7 +172,7 @@ class BaoStockProvider:
                     continue
                 df = pd.DataFrame(rows, columns=rs.fields)
                 parts.append(df)
-            if last_err is None:
+            if not need_retry:
                 break
             time.sleep(1.0 * (2**attempt))
         if not parts:

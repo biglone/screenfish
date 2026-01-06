@@ -103,30 +103,30 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
             if not codes:
                 typer.echo(f"error: empty stock list; cannot update {range_start}..{range_end}", err=True)
                 raise typer.Exit(code=2)
-            provider_name = "baostock"
-            target_ts_codes = {bs_to_ts_code(c) for c in codes}
 
-            done = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
-            if not done:
-                seed = backend.distinct_ts_codes_in_range(start=range_start, end=range_end)
-                if seed:
-                    with backend.connect() as conn:
-                        for ts_code in seed:
-                            backend.mark_progress_ts_code_in_conn(
-                                conn,
-                                provider=provider_name,
-                                range_start=range_start,
-                                range_end=range_end,
-                                ts_code=ts_code,
-                            )
-                    done = set(seed)
-            typer.echo(
-                f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done & target_ts_codes)}"
-            )
+        provider_name = "baostock"
+        target_ts_codes = {bs_to_ts_code(c) for c in codes}
 
-            batches = _batched(codes, batch_size=200)
-            for bi, batch in enumerate(batches, start=1):
-                typer.echo(f"batch: {bi}/{len(batches)}")
+        done = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
+        if not done:
+            seed = backend.distinct_ts_codes_in_range(start=range_start, end=range_end)
+            if seed:
+                with backend.connect() as conn:
+                    for ts_code in seed:
+                        backend.mark_progress_ts_code_in_conn(
+                            conn,
+                            provider=provider_name,
+                            range_start=range_start,
+                            range_end=range_end,
+                            ts_code=ts_code,
+                        )
+                done = set(seed)
+        typer.echo(f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done & target_ts_codes)}")
+
+        batches = _batched(codes, batch_size=200)
+        for bi, batch in enumerate(batches, start=1):
+            typer.echo(f"batch: {bi}/{len(batches)}")
+            with p.session() as bs:
                 with backend.connect() as conn:
                     for code in batch:
                         ts_code = bs_to_ts_code(code)
@@ -145,6 +145,7 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
                                 range_end=range_end,
                                 ts_code=ts_code,
                             )
+                            conn.commit()
                             continue
                         backend.upsert_daily_df_in_conn(conn, df)
                         backend.mark_progress_ts_code_in_conn(
@@ -154,32 +155,33 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
                             range_end=range_end,
                             ts_code=ts_code,
                         )
+                        conn.commit()
                         done.add(ts_code)
 
-            progress = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
-            completed = len(progress & target_ts_codes)
-            if completed < len(target_ts_codes):
-                typer.echo(f"incomplete: completed {completed}/{len(target_ts_codes)} stocks; rerun to resume", err=True)
-                raise typer.Exit(code=1)
+        progress = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
+        completed = len(progress & target_ts_codes)
+        if completed < len(target_ts_codes):
+            typer.echo(f"incomplete: completed {completed}/{len(target_ts_codes)} stocks; rerun to resume", err=True)
+            raise typer.Exit(code=1)
 
-            dates_with_rows = [d for d in missing_sorted if backend.count_daily_rows_for_trade_date(d) > 0]
-            if not dates_with_rows:
-                backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
-                typer.echo(
-                    f"no daily rows for {range_start}..{range_end}; provider may not have published data yet, please rerun later",
-                    err=True,
-                )
-                raise typer.Exit(code=1)
+        dates_with_rows = [d for d in missing_sorted if backend.count_daily_rows_for_trade_date(d) > 0]
+        if not dates_with_rows:
+            backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
+            typer.echo(
+                f"no daily rows for {range_start}..{range_end}; provider may not have published data yet, please rerun later",
+                err=True,
+            )
+            raise typer.Exit(code=1)
 
-            with backend.connect() as conn:
-                for d in dates_with_rows:
-                    backend.mark_trade_date_updated_in_conn(conn, d)
+        with backend.connect() as conn:
+            for d in dates_with_rows:
+                backend.mark_trade_date_updated_in_conn(conn, d)
 
-            if len(dates_with_rows) != len(missing_sorted):
-                backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
-                remaining = [d for d in missing_sorted if d not in dates_with_rows]
-                typer.echo(f"partial update; remaining dates: {remaining}; rerun to resume", err=True)
-                raise typer.Exit(code=1)
+        if len(dates_with_rows) != len(missing_sorted):
+            backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
+            remaining = [d for d in missing_sorted if d not in dates_with_rows]
+            typer.echo(f"partial update; remaining dates: {remaining}; rerun to resume", err=True)
+            raise typer.Exit(code=1)
         typer.echo("done")
         return
 

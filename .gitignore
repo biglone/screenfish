@@ -8,6 +8,7 @@ __pycache__/
 data/
 *.sqlite3
 *.db
+*.log
 results*.csv
 results*.json
 today_*.csv

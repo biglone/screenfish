@@ -58,9 +58,14 @@ class SqliteBackend:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(str(self.path))
+        # Use a longer timeout to tolerate transient lock contention (e.g. concurrent readers/writers).
+        conn = sqlite3.connect(str(self.path), timeout=30)
         try:
             conn.row_factory = sqlite3.Row
+            # These PRAGMAs are per-connection; ensure consistent behavior across all connections.
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
             yield conn
             conn.commit()
         finally:
