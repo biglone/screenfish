@@ -162,9 +162,24 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
                 typer.echo(f"incomplete: completed {completed}/{len(target_ts_codes)} stocks; rerun to resume", err=True)
                 raise typer.Exit(code=1)
 
+            dates_with_rows = [d for d in missing_sorted if backend.count_daily_rows_for_trade_date(d) > 0]
+            if not dates_with_rows:
+                backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
+                typer.echo(
+                    f"no daily rows for {range_start}..{range_end}; provider may not have published data yet, please rerun later",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
             with backend.connect() as conn:
-                for d in missing_sorted:
+                for d in dates_with_rows:
                     backend.mark_trade_date_updated_in_conn(conn, d)
+
+            if len(dates_with_rows) != len(missing_sorted):
+                backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
+                remaining = [d for d in missing_sorted if d not in dates_with_rows]
+                typer.echo(f"partial update; remaining dates: {remaining}; rerun to resume", err=True)
+                raise typer.Exit(code=1)
         typer.echo("done")
         return
 

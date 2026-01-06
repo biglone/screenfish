@@ -208,6 +208,18 @@ class SqliteBackend:
             return None
         return row["d"]
 
+    def count_daily_rows_for_trade_date(self, trade_date: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM daily WHERE trade_date = ?", (trade_date,)).fetchone()
+        return int(row["n"]) if row else 0
+
+    def clear_progress(self, *, provider: str, range_start: str, range_end: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM provider_stock_progress WHERE provider = ? AND range_start = ? AND range_end = ?",
+                (provider, range_start, range_end),
+            )
+
     def mark_progress_ts_code_in_conn(
         self,
         conn: sqlite3.Connection,
