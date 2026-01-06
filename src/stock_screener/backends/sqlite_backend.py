@@ -38,6 +38,15 @@ class SqliteBackend:
                   trade_date TEXT PRIMARY KEY,
                   updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS provider_stock_progress (
+                  provider TEXT NOT NULL,
+                  range_start TEXT NOT NULL,
+                  range_end TEXT NOT NULL,
+                  ts_code TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (provider, range_start, range_end, ts_code)
+                );
                 """
             )
 
@@ -130,3 +139,46 @@ class SqliteBackend:
                 (start, end),
             ).fetchall()
         return pd.DataFrame(rows, columns=rows[0].keys() if rows else None)
+
+    def get_progress_ts_codes(self, *, provider: str, range_start: str, range_end: str) -> set[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ts_code
+                FROM provider_stock_progress
+                WHERE provider = ? AND range_start = ? AND range_end = ?
+                """,
+                (provider, range_start, range_end),
+            ).fetchall()
+        return {row["ts_code"] for row in rows}
+
+    def mark_progress_ts_code_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        provider: str,
+        range_start: str,
+        range_end: str,
+        ts_code: str,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO provider_stock_progress
+              (provider, range_start, range_end, ts_code, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (provider, range_start, range_end, ts_code, now),
+        )
+
+    def distinct_ts_codes_in_range(self, *, start: str, end: str) -> set[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ts_code
+                FROM daily
+                WHERE trade_date >= ? AND trade_date <= ?
+                """,
+                (start, end),
+            ).fetchall()
+        return {row["ts_code"] for row in rows}

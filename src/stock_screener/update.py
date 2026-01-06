@@ -7,6 +7,7 @@ from stock_screener.config import Settings
 from stock_screener.dates import parse_yyyymmdd
 from stock_screener.providers import get_provider
 from stock_screener.providers.baostock_provider import BaoStockNotConfigured
+from stock_screener.providers.baostock_provider import bs_to_ts_code
 from stock_screener.providers.tushare_provider import TuShareTokenMissing
 from stock_screener.tushare_client import TuShareNotConfigured
 
@@ -59,21 +60,46 @@ def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> 
             return
 
         missing_sorted = sorted(missing)
-        ranges = [(missing_sorted[0], missing_sorted[-1])]
+        range_start, range_end = missing_sorted[0], missing_sorted[-1]
+        ranges = [(range_start, range_end)]
 
         with p.session() as bs:
             codes = p._all_stock_codes(bs=bs, day=end)
-            typer.echo(f"stocks: {len(codes)}, range: {ranges[0][0]}..{ranges[0][1]}")
+            provider_name = "baostock"
+            done = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
+            if not done:
+                done = backend.distinct_ts_codes_in_range(start=range_start, end=range_end)
+            typer.echo(
+                f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done)}"
+            )
 
             batches = _batched(codes, batch_size=200)
             for bi, batch in enumerate(batches, start=1):
                 typer.echo(f"batch: {bi}/{len(batches)}")
                 with backend.connect() as conn:
                     for code in batch:
+                        ts_code = bs_to_ts_code(code)
+                        if ts_code in done:
+                            continue
                         df = p._fetch_daily_ranges(bs=bs, bs_code=code, ranges=ranges)
                         if df.empty:
+                            backend.mark_progress_ts_code_in_conn(
+                                conn,
+                                provider=provider_name,
+                                range_start=range_start,
+                                range_end=range_end,
+                                ts_code=ts_code,
+                            )
                             continue
                         backend.upsert_daily_df_in_conn(conn, df)
+                        backend.mark_progress_ts_code_in_conn(
+                            conn,
+                            provider=provider_name,
+                            range_start=range_start,
+                            range_end=range_end,
+                            ts_code=ts_code,
+                        )
+                        done.add(ts_code)
 
             with backend.connect() as conn:
                 for d in missing_sorted:
