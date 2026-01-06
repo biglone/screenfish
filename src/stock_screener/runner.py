@@ -85,7 +85,9 @@ def run_screen(
     ]
     if with_name:
         base_cols.insert(2, cols.name)
-        if not hits.empty:
+        if hits.empty:
+            hits[cols.name] = pd.Series(dtype="string")
+        else:
             name_map = backend.load_stock_names(hits["ts_code"].astype(str).unique().tolist())
             hits[cols.name] = hits["ts_code"].astype(str).map(name_map)
 

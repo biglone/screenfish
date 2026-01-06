@@ -148,3 +148,28 @@ KDJ 中 `RSV = (CLOSE-LLV(LOW,N))/(HHV(HIGH,N)-LLV(LOW,N))*100`：
 可用 `cron`/任务计划每天运行：
 1) `stock_screener update --start {最近N天} --end {今天}`
 2) `stock_screener run --date {今天} --out results.csv`
+
+## 后台服务（REST API）
+
+提供一个常驻后台服务，便于你判断“当日日线是否可拉取”、轮询拉取并在数据到位后执行筛选。
+
+启动服务（默认 `127.0.0.1:8000`）：
+
+```bash
+stock_screener serve --cache ./data
+```
+
+API 文档（OpenAPI）：
+- `http://127.0.0.1:8000/docs`
+
+可选鉴权（如果设置了环境变量则必须带请求头）：
+- `export STOCK_SCREENER_API_KEY="your-key"`
+- 请求头：`X-API-Key: your-key`
+
+常用接口（Base URL：`/v1`）：
+- `GET /v1/status`：查看本地缓存状态与最新交易日
+- `GET /v1/data/availability?provider=baostock&date=YYYYMMDD`：探测当日日线是否已可取
+- `POST /v1/update`：触发更新（支持 `start/end` 或自动模式）
+- `POST /v1/update/wait`：轮询更新直到目标日期数据可用或超时
+- `POST /v1/screen`：对指定日期/最新日期执行筛选
+- `POST /v1/export/ebk`：导出筛选命中的 `.EBK` 内容（可用于通达信导入）

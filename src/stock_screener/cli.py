@@ -11,6 +11,7 @@ from stock_screener.names import sync_names
 from stock_screener.runner import run_screen
 from stock_screener.tdx import write_ebk
 from stock_screener.update import update_daily
+from stock_screener.server import create_app
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -86,6 +87,17 @@ def export_ebk_cmd(
     results = run_screen(settings=settings, date=date, combo=combo, lookback_days=lookback_days, rules=rules)
     out.parent.mkdir(parents=True, exist_ok=True)
     write_ebk(results["ts_code"].astype(str).tolist(), out)
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Bind host"),
+    port: int = typer.Option(8000, help="Bind port"),
+    data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
+    cache: Path = typer.Option(Path("./data"), help="Cache directory"),
+) -> None:
+    settings = Settings(cache_dir=cache, data_backend=data_backend)
+    import uvicorn
+
+    uvicorn.run(create_app(settings=settings), host=host, port=port)
 
 
 if __name__ == "__main__":

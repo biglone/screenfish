@@ -10,3 +10,7 @@ data/
 *.db
 results*.csv
 results*.json
+today_*.csv
+today_*.json
+*.EBK
+sample.EBK
