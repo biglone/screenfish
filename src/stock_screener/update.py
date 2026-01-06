@@ -11,6 +11,12 @@ from stock_screener.providers.tushare_provider import TuShareTokenMissing
 from stock_screener.tushare_client import TuShareNotConfigured
 
 
+def _batched(values: list[str], batch_size: int) -> list[list[str]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    return [values[i : i + batch_size] for i in range(0, len(values), batch_size)]
+
+
 def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> None:
     if settings.data_backend != "sqlite":
         raise typer.BadParameter("only sqlite backend is implemented")
@@ -34,15 +40,16 @@ def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> 
     typer.echo(f"open trade dates: {len(open_dates)}, missing: {len(missing)}")
 
     if getattr(p, "name", "") == "tushare":
-        for d in missing:
-            typer.echo(f"updating {d} ...")
-            df = p.daily_by_trade_date(trade_date=d)
-            if df.empty:
-                typer.echo(f"warning: empty daily for {d}", err=True)
-                backend.mark_trade_date_updated(d)
-                continue
-            backend.upsert_daily_df(df)
-            backend.mark_trade_date_updated(d)
+        with backend.connect() as conn:
+            for d in missing:
+                typer.echo(f"updating {d} ...")
+                df = p.daily_by_trade_date(trade_date=d)
+                if df.empty:
+                    typer.echo(f"warning: empty daily for {d}", err=True)
+                    backend.mark_trade_date_updated_in_conn(conn, d)
+                    continue
+                backend.upsert_daily_df_in_conn(conn, df)
+                backend.mark_trade_date_updated_in_conn(conn, d)
         typer.echo("done")
         return
 
@@ -57,16 +64,20 @@ def update_daily(*, settings: Settings, start: str, end: str, provider: str) -> 
         with p.session() as bs:
             codes = p._all_stock_codes(bs=bs, day=end)
             typer.echo(f"stocks: {len(codes)}, range: {ranges[0][0]}..{ranges[0][1]}")
-            for i, code in enumerate(codes, start=1):
-                if i % 200 == 0:
-                    typer.echo(f"progress: {i}/{len(codes)}")
-                df = p._fetch_daily_ranges(bs=bs, bs_code=code, ranges=ranges)
-                if df.empty:
-                    continue
-                backend.upsert_daily_df(df)
 
-        for d in missing_sorted:
-            backend.mark_trade_date_updated(d)
+            batches = _batched(codes, batch_size=200)
+            for bi, batch in enumerate(batches, start=1):
+                typer.echo(f"batch: {bi}/{len(batches)}")
+                with backend.connect() as conn:
+                    for code in batch:
+                        df = p._fetch_daily_ranges(bs=bs, bs_code=code, ranges=ranges)
+                        if df.empty:
+                            continue
+                        backend.upsert_daily_df_in_conn(conn, df)
+
+            with backend.connect() as conn:
+                for d in missing_sorted:
+                    backend.mark_trade_date_updated_in_conn(conn, d)
         typer.echo("done")
         return
 

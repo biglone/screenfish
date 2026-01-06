@@ -61,25 +61,37 @@ class SqliteBackend:
         return {row["trade_date"] for row in rows}
 
     def mark_trade_date_updated(self, trade_date: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO update_log (trade_date, updated_at) VALUES (?, ?)",
-                (trade_date, now),
-            )
+            self.mark_trade_date_updated_in_conn(conn, trade_date)
+
+    def mark_trade_date_updated_in_conn(self, conn: sqlite3.Connection, trade_date: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT OR REPLACE INTO update_log (trade_date, updated_at) VALUES (?, ?)",
+            (trade_date, now),
+        )
 
     def upsert_daily_rows(self, rows: Iterable[tuple]) -> None:
         with self.connect() as conn:
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO daily
-                  (ts_code, trade_date, open, high, low, close, vol, amount)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
+            self.upsert_daily_rows_in_conn(conn, rows)
+
+    def upsert_daily_rows_in_conn(self, conn: sqlite3.Connection, rows: Iterable[tuple]) -> None:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO daily
+              (ts_code, trade_date, open, high, low, close, vol, amount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
     def upsert_daily_df(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        with self.connect() as conn:
+            self.upsert_daily_df_in_conn(conn, df)
+
+    def upsert_daily_df_in_conn(self, conn: sqlite3.Connection, df: pd.DataFrame) -> None:
         if df.empty:
             return
         required = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"]
@@ -91,7 +103,7 @@ class SqliteBackend:
             .astype({"ts_code": "string", "trade_date": "string"})
             .itertuples(index=False, name=None)
         )
-        self.upsert_daily_rows(rows)
+        self.upsert_daily_rows_in_conn(conn, rows)
 
     def load_daily_between(self, start: str, end: str) -> pd.DataFrame:
         with self.connect() as conn:
@@ -118,4 +130,3 @@ class SqliteBackend:
                 (start, end),
             ).fetchall()
         return pd.DataFrame(rows, columns=rows[0].keys() if rows else None)
-
