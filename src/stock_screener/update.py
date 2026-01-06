@@ -95,6 +95,14 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
 
         with p.session() as bs:
             codes = p._all_stock_codes(bs=bs, day=range_end)
+            if not codes:
+                fallback_day = backend.max_trade_date_in_daily()
+                if fallback_day and fallback_day != range_end:
+                    typer.echo(f"warning: empty stock list for {range_end}, fallback to {fallback_day}", err=True)
+                    codes = p._all_stock_codes(bs=bs, day=fallback_day)
+            if not codes:
+                typer.echo(f"error: empty stock list; cannot update {range_start}..{range_end}", err=True)
+                raise typer.Exit(code=2)
             provider_name = "baostock"
             target_ts_codes = {bs_to_ts_code(c) for c in codes}
 
