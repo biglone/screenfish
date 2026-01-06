@@ -1,8 +1,16 @@
 # A股日线自动更新 + 指标筛选（离线工具）
 
-这是一个**仅做数据处理**的离线 CLI 工具：使用 TuShare Pro 拉取全市场 A 股日线数据到本地缓存（SQLite），按通达信风格函数计算指标并执行筛选，导出当日命中列表为 CSV/JSON。
+这是一个**仅做数据处理**的离线 CLI 工具：从数据源拉取全市场 A 股日线数据到本地缓存（SQLite），按通达信风格函数计算指标并执行筛选，导出当日命中列表为 CSV/JSON。
 
-> 合规声明：本项目不做任何破解/逆向/绕过授权取数；仅支持 TuShare Pro 官方接口（需要 token）。本工具不提供投资建议/荐股结论。
+> 合规声明：本项目不做任何破解/逆向/绕过授权取数；本工具不提供投资建议/荐股结论。
+
+## 数据源（可选）
+
+目前支持两种数据源：
+- `baostock`：默认；无需 token。更新速度取决于网络与全市场股票数量（按股票拉取）。
+- `tushare`：TuShare Pro（需要 `TUSHARE_TOKEN`）。
+
+请确保你使用的数据源符合其官方/项目条款。
 
 ## 安装
 
@@ -42,8 +50,16 @@ stock_screener update --start 20240101 --end 20240131
 ```
 
 参数：
+- `--provider baostock|tushare`：数据源（默认 `baostock`）
 - `--cache ./data`：缓存目录
 - `--data-backend sqlite`：当前仅实现 SQLite（默认）
+
+示例（TuShare Pro）：
+
+```bash
+export TUSHARE_TOKEN="你的token"
+stock_screener update --provider tushare --start 20240101 --end 20240131
+```
 
 ## 运行筛选并导出
 
@@ -106,4 +122,3 @@ KDJ 中 `RSV = (CLOSE-LLV(LOW,N))/(HHV(HIGH,N)-LLV(LOW,N))*100`：
 可用 `cron`/任务计划每天运行：
 1) `stock_screener update --start {最近N天} --end {今天}`
 2) `stock_screener run --date {今天} --out results.csv`
-

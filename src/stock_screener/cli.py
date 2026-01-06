@@ -17,11 +17,12 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 def update(
     start: str = typer.Option(..., help="Start date YYYYMMDD"),
     end: str = typer.Option(..., help="End date YYYYMMDD"),
+    provider: str = typer.Option("baostock", help="baostock|tushare"),
     data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
 ) -> None:
     settings = Settings(cache_dir=cache, data_backend=data_backend)
-    update_daily(settings=settings, start=start, end=end)
+    update_daily(settings=settings, start=start, end=end, provider=provider)
 
 
 @app.command()
@@ -49,4 +50,3 @@ def run(
 
 if __name__ == "__main__":
     app()
-
