@@ -11,4 +11,3 @@ def get_provider(name: str):
     if n == "baostock":
         return BaoStockProvider()
     raise ValueError("provider must be 'baostock' or 'tushare'")
-

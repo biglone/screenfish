@@ -70,6 +70,13 @@ stock_screener run --date 20240131 --combo and --out results.csv
 stock_screener run --date 20240131 --combo and --out results.json
 ```
 
+如需导出股票名称（`name` 列），先同步名称缓存再运行：
+
+```bash
+stock_screener sync-names --provider baostock --date 20240131
+stock_screener run --date 20240131 --combo and --out results.csv --with-name
+```
+
 输出字段：
 - `trade_date, ts_code, close, amount, ma60, mid_bullbear, j, rules`
 

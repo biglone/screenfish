@@ -16,6 +16,7 @@ from stock_screener.rules import resolve_rules
 class ScreenResultColumns:
     trade_date: str = "trade_date"
     ts_code: str = "ts_code"
+    name: str = "name"
     close: str = "close"
     amount: str = "amount"
     ma60: str = "ma60"
@@ -31,6 +32,7 @@ def run_screen(
     combo: Literal["and", "or"],
     lookback_days: int = 200,
     rules: str | None = None,
+    with_name: bool = False,
 ) -> pd.DataFrame:
     if settings.data_backend != "sqlite":
         raise typer.BadParameter("only sqlite backend is implemented")
@@ -70,36 +72,30 @@ def run_screen(
     selected = df["trade_date"] == date
     hits = df.loc[selected & combined].copy()
 
+    cols = ScreenResultColumns()
+    base_cols = [
+        cols.trade_date,
+        cols.ts_code,
+        cols.close,
+        cols.amount,
+        cols.ma60,
+        cols.mid_bullbear,
+        cols.j,
+        cols.rules,
+    ]
+    if with_name:
+        base_cols.insert(2, cols.name)
+        if not hits.empty:
+            name_map = backend.load_stock_names(hits["ts_code"].astype(str).unique().tolist())
+            hits[cols.name] = hits["ts_code"].astype(str).map(name_map)
+
     if hits.empty:
-        return hits.assign(rules=pd.Series(dtype="string"))[
-            [
-                ScreenResultColumns.trade_date,
-                ScreenResultColumns.ts_code,
-                ScreenResultColumns.close,
-                ScreenResultColumns.amount,
-                ScreenResultColumns.ma60,
-                ScreenResultColumns.mid_bullbear,
-                ScreenResultColumns.j,
-                ScreenResultColumns.rules,
-            ]
-        ]
+        return hits.assign(rules=pd.Series(dtype="string"))[base_cols]
 
     def _rules_for_row(idx: int) -> str:
         matched = [name for name, m in masks.items() if bool(m.loc[idx])]
         return ",".join(matched)
 
     hits["rules"] = [_rules_for_row(i) for i in hits.index]
-    cols = ScreenResultColumns()
-    out = hits[
-        [
-            cols.trade_date,
-            cols.ts_code,
-            cols.close,
-            cols.amount,
-            cols.ma60,
-            cols.mid_bullbear,
-            cols.j,
-            cols.rules,
-        ]
-    ].sort_values([cols.trade_date, cols.ts_code], kind="mergesort")
+    out = hits[base_cols].sort_values([cols.trade_date, cols.ts_code], kind="mergesort")
     return out.reset_index(drop=True)

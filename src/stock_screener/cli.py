@@ -7,6 +7,7 @@ from typing import Optional
 import typer
 
 from stock_screener.config import Settings
+from stock_screener.names import sync_names
 from stock_screener.runner import run_screen
 from stock_screener.update import update_daily
 
@@ -25,6 +26,17 @@ def update(
     update_daily(settings=settings, start=start, end=end, provider=provider)
 
 
+@app.command("sync-names")
+def sync_names_cmd(
+    date: str = typer.Option(..., help="Reference date YYYYMMDD (used by some providers)"),
+    provider: str = typer.Option("baostock", help="baostock|tushare"),
+    data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
+    cache: Path = typer.Option(Path("./data"), help="Cache directory"),
+) -> None:
+    settings = Settings(cache_dir=cache, data_backend=data_backend)
+    sync_names(settings=settings, provider=provider, date=date)
+
+
 @app.command()
 def run(
     date: str = typer.Option(..., help="Trade date YYYYMMDD"),
@@ -34,9 +46,17 @@ def run(
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
     lookback_days: int = typer.Option(200, help="Calendar days lookback to compute indicators"),
     rules: Optional[str] = typer.Option(None, help="Comma-separated rule names (default: built-in)"),
+    with_name: bool = typer.Option(False, help="Include stock name (requires local stock_basic cache)"),
 ) -> None:
     settings = Settings(cache_dir=cache, data_backend=data_backend)
-    results = run_screen(settings=settings, date=date, combo=combo, lookback_days=lookback_days, rules=rules)
+    results = run_screen(
+        settings=settings,
+        date=date,
+        combo=combo,
+        lookback_days=lookback_days,
+        rules=rules,
+        with_name=with_name,
+    )
 
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.suffix.lower() == ".csv":

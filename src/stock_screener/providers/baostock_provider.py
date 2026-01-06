@@ -85,6 +85,35 @@ class BaoStockProvider:
             codes.append(row[0])
         return codes
 
+    def _all_stock_basics(self, *, bs, day: str) -> pd.DataFrame:
+        rs = bs.query_all_stock(day=_to_iso(day))
+        if rs.error_code != "0":  # pragma: no cover
+            raise RuntimeError(f"baostock query_all_stock failed: {rs.error_msg}")
+        rows = []
+        while rs.next():
+            row = rs.get_row_data()
+            if not row:
+                continue
+            rows.append(row)
+        if not rows:
+            return pd.DataFrame(columns=["ts_code", "name"])
+
+        df = pd.DataFrame(rows, columns=rs.fields)
+        # BaoStock fields differ across versions; try common patterns.
+        code_col = "code" if "code" in df.columns else df.columns[0]
+        if "code_name" in df.columns:
+            name_col = "code_name"
+        elif "name" in df.columns:
+            name_col = "name"
+        else:
+            # fallback: second column if present
+            name_col = df.columns[1] if len(df.columns) > 1 else None
+
+        out = pd.DataFrame()
+        out["ts_code"] = df[code_col].astype(str).map(bs_to_ts_code)
+        out["name"] = df[name_col].astype(str) if name_col else pd.NA
+        return out[["ts_code", "name"]]
+
     def all_stock_codes(self, *, day: str) -> list[str]:
         with self.session() as bs:
             return self._all_stock_codes(bs=bs, day=day)

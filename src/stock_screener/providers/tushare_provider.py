@@ -29,3 +29,19 @@ class TuShareProvider:
         client = self._client()
         return client.daily_by_trade_date(trade_date=trade_date)
 
+    def stock_basics(self) -> pd.DataFrame:
+        client = self._client()
+        pro = client._pro()
+
+        def _fetch(status: str) -> pd.DataFrame:
+            return pro.stock_basic(exchange="", list_status=status, fields="ts_code,name")
+
+        frames = []
+        for st in ("L", "D", "P"):
+            df = _fetch(st)
+            if df is not None and not df.empty:
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame(columns=["ts_code", "name"])
+        out = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["ts_code"])
+        return out[["ts_code", "name"]]

@@ -39,6 +39,12 @@ class SqliteBackend:
                   updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS stock_basic (
+                  ts_code TEXT PRIMARY KEY,
+                  name TEXT,
+                  updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS provider_stock_progress (
                   provider TEXT NOT NULL,
                   range_start TEXT NOT NULL,
@@ -151,6 +157,42 @@ class SqliteBackend:
                 (provider, range_start, range_end),
             ).fetchall()
         return {row["ts_code"] for row in rows}
+
+    def upsert_stock_basic_df(self, df: pd.DataFrame) -> None:
+        with self.connect() as conn:
+            self.upsert_stock_basic_df_in_conn(conn, df)
+
+    def upsert_stock_basic_df_in_conn(self, conn: sqlite3.Connection, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        required = ["ts_code", "name"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"missing columns in stock_basic df: {missing}")
+        now = datetime.now(timezone.utc).isoformat()
+        tmp = df[required].copy()
+        tmp["ts_code"] = tmp["ts_code"].astype(str)
+        tmp["name"] = tmp["name"].astype(object).where(tmp["name"].notna(), None)
+        tmp["updated_at"] = now
+        rows = tmp[["ts_code", "name", "updated_at"]].itertuples(index=False, name=None)
+        conn.executemany(
+            "INSERT OR REPLACE INTO stock_basic (ts_code, name, updated_at) VALUES (?, ?, ?)",
+            rows,
+        )
+
+    def load_stock_names(self, ts_codes: Sequence[str]) -> dict[str, str]:
+        if not ts_codes:
+            return {}
+        placeholders = ",".join(["?"] * len(ts_codes))
+        query = f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({placeholders})"
+        with self.connect() as conn:
+            rows = conn.execute(query, list(ts_codes)).fetchall()
+        out: dict[str, str] = {}
+        for r in rows:
+            if r["name"] is None:
+                continue
+            out[str(r["ts_code"])] = str(r["name"])
+        return out
 
     def mark_progress_ts_code_in_conn(
         self,
