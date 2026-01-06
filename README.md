@@ -77,6 +77,18 @@ stock_screener sync-names --provider baostock --date 20240131
 stock_screener run --date 20240131 --combo and --out results.csv --with-name
 ```
 
+## 导入通达信（.EBK）
+
+通达信 `.EBK` 是“股票列表”导入/导出格式，本项目可直接导出筛选命中的股票列表：
+
+```bash
+stock_screener export-ebk --date 20240131 --combo and --out results.EBK
+```
+
+生成的 `.EBK` 按样例口径写入：
+- CRLF 文本
+- 每行 7 位：`0+6位`(SZ)、`1+6位`(SH)、`2+6位`(BJ)
+
 输出字段：
 - `trade_date, ts_code, close, amount, ma60, mid_bullbear, j, rules`
 
