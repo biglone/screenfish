@@ -94,7 +94,7 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
         ranges = [(range_start, range_end)]
 
         with p.session() as bs:
-            codes = p._all_stock_codes(bs=bs, day=end)
+            codes = p._all_stock_codes(bs=bs, day=range_end)
             provider_name = "baostock"
             target_ts_codes = {bs_to_ts_code(c) for c in codes}
 
