@@ -59,12 +59,28 @@ class SqliteBackend:
                   name TEXT NOT NULL UNIQUE,
                   formula TEXT NOT NULL,
                   description TEXT,
+                  kind TEXT NOT NULL DEFAULT 'screen',
+                  timeframe TEXT,
                   enabled INTEGER NOT NULL DEFAULT 1,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Best-effort schema migrations for existing databases."""
+
+        def _has_column(table: str, column: str) -> bool:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            return any(r["name"] == column for r in rows)
+
+        # Formulas: add kind/timeframe columns for older DBs.
+        if not _has_column("formulas", "kind"):
+            conn.execute("ALTER TABLE formulas ADD COLUMN kind TEXT NOT NULL DEFAULT 'screen'")
+        if not _has_column("formulas", "timeframe"):
+            conn.execute("ALTER TABLE formulas ADD COLUMN timeframe TEXT")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -274,17 +290,23 @@ class SqliteBackend:
         name: str,
         formula: str,
         description: str | None = None,
+        kind: str = "screen",
+        timeframe: str | None = None,
         enabled: bool = True,
     ) -> dict:
         """创建新公式"""
+        if kind != "indicator":
+            timeframe = None
+        if kind == "indicator" and timeframe is None:
+            timeframe = "D"
         now = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO formulas (name, formula, description, enabled, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO formulas (name, formula, description, kind, timeframe, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name, formula, description, 1 if enabled else 0, now, now),
+                (name, formula, description, kind, timeframe, 1 if enabled else 0, now, now),
             )
             formula_id = cursor.lastrowid
         return self.get_formula(formula_id)
@@ -303,6 +325,8 @@ class SqliteBackend:
             "name": row["name"],
             "formula": row["formula"],
             "description": row["description"],
+            "kind": row["kind"],
+            "timeframe": row["timeframe"],
             "enabled": bool(row["enabled"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -322,28 +346,36 @@ class SqliteBackend:
             "name": row["name"],
             "formula": row["formula"],
             "description": row["description"],
+            "kind": row["kind"],
+            "timeframe": row["timeframe"],
             "enabled": bool(row["enabled"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
 
-    def list_formulas(self, *, enabled_only: bool = False) -> list[dict]:
+    def list_formulas(self, *, enabled_only: bool = False, kind: str | None = None) -> list[dict]:
         """列出所有公式"""
         with self.connect() as conn:
+            query = "SELECT * FROM formulas"
+            params: list[object] = []
+            where: list[str] = []
             if enabled_only:
-                rows = conn.execute(
-                    "SELECT * FROM formulas WHERE enabled = 1 ORDER BY id ASC"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM formulas ORDER BY id ASC"
-                ).fetchall()
+                where.append("enabled = 1")
+            if kind is not None:
+                where.append("kind = ?")
+                params.append(kind)
+            if where:
+                query += " WHERE " + " AND ".join(where)
+            query += " ORDER BY id ASC"
+            rows = conn.execute(query, params).fetchall()
         return [
             {
                 "id": row["id"],
                 "name": row["name"],
                 "formula": row["formula"],
                 "description": row["description"],
+                "kind": row["kind"],
+                "timeframe": row["timeframe"],
                 "enabled": bool(row["enabled"]),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
@@ -358,6 +390,8 @@ class SqliteBackend:
         name: str | None = None,
         formula: str | None = None,
         description: str | None = None,
+        kind: str | None = None,
+        timeframe: str | None = None,
         enabled: bool | None = None,
     ) -> dict | None:
         """更新公式"""
@@ -376,6 +410,17 @@ class SqliteBackend:
         if description is not None:
             updates.append("description = ?")
             params.append(description)
+        if kind is not None:
+            updates.append("kind = ?")
+            params.append(kind)
+            # Keep timeframe consistent when switching kind.
+            if kind != "indicator":
+                timeframe = None
+            elif timeframe is None and existing.get("timeframe") is None:
+                timeframe = "D"
+        if timeframe is not None or (kind is not None and kind != "indicator"):
+            updates.append("timeframe = ?")
+            params.append(timeframe)
         if enabled is not None:
             updates.append("enabled = ?")
             params.append(1 if enabled else 0)

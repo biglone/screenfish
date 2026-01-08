@@ -1,23 +1,29 @@
 from __future__ import annotations
 
+import math
 import os
+import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date as _date
 from typing import Any, Literal
 
+import pandas as pd
+import typer
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from stock_screener.backends.sqlite_backend import SqliteBackend
 from stock_screener.config import Settings
 from stock_screener.dates import format_yyyymmdd, parse_yyyymmdd
-from stock_screener.providers.baostock_provider import BaoStockNotConfigured
-from stock_screener.providers.tushare_provider import TuShareTokenMissing
+from stock_screener.formula_parser import execute_formula, execute_formula_outputs
+from stock_screener.pinyin import pinyin_full, pinyin_initials
 from stock_screener.runner import run_screen
 from stock_screener.tdx import TdxEbkFormat, ts_code_to_ebk_code
-from stock_screener.update import update_daily
+from stock_screener.update import UpdateBadRequest, UpdateIncomplete, UpdateNotConfigured, update_daily_service
 
 
 def _api_key_required(x_api_key: str | None = Header(default=None)) -> None:
@@ -114,6 +120,8 @@ class FormulaItem(BaseModel):
     name: str
     formula: str
     description: str | None = None
+    kind: Literal["screen", "indicator"] = "screen"
+    timeframe: Literal["D", "W", "M"] | None = None
     enabled: bool = True
     created_at: str
     updated_at: str
@@ -128,6 +136,8 @@ class FormulaCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     formula: str = Field(..., min_length=1)
     description: str | None = None
+    kind: Literal["screen", "indicator"] = "screen"
+    timeframe: Literal["D", "W", "M"] | None = None
     enabled: bool = True
 
 
@@ -135,6 +145,8 @@ class FormulaUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     formula: str | None = Field(default=None, min_length=1)
     description: str | None = None
+    kind: Literal["screen", "indicator"] | None = None
+    timeframe: Literal["D", "W", "M"] | None = None
     enabled: bool | None = None
 
 
@@ -145,6 +157,25 @@ class FormulaValidateRequest(BaseModel):
 class FormulaValidateResponse(BaseModel):
     valid: bool
     message: str
+
+
+class IndicatorPoint(BaseModel):
+    trade_date: str
+    value: float | None
+
+
+class IndicatorLine(BaseModel):
+    name: str
+    points: list[IndicatorPoint]
+
+
+class IndicatorSeriesResponse(BaseModel):
+    ts_code: str
+    formula_id: int
+    name: str
+    timeframe: Literal["D", "W", "M"]
+    points: list[IndicatorPoint]
+    lines: list[IndicatorLine] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -158,10 +189,66 @@ def _backend(settings: Settings) -> SqliteBackend:
     return backend
 
 
+class _StripPrefixMiddleware:
+    def __init__(self, app: Any, *, prefix: str) -> None:
+        self.app = app
+        self.prefix = prefix.rstrip("/") or prefix
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") in {"http", "websocket"}:
+            path = str(scope.get("path") or "")
+            if path == self.prefix or path.startswith(self.prefix + "/"):
+                new_scope = dict(scope)
+                new_scope["path"] = path[len(self.prefix) :] or "/"
+                root_path = str(new_scope.get("root_path") or "")
+                new_scope["root_path"] = root_path + self.prefix
+                await self.app(new_scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def create_app(*, settings: Settings) -> FastAPI:
-    app = FastAPI(title="stock_screener", version="0.1.0")
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        prewarm_pinyin_env = os.environ.get("STOCK_SCREENER_PREWARM_PINYIN", "1").strip().lower()
+        prewarm_pinyin = prewarm_pinyin_env in {"1", "true", "yes", "y", "on"}
+        if prewarm_pinyin:
+            # Warm up pinyin cache to avoid the first pinyin search request paying the full cost.
+            import sqlite3 as _sqlite3
+
+            try:
+                SqliteBackend(settings.sqlite_path).init()
+                conn = _sqlite3.connect(str(settings.sqlite_path))
+                try:
+                    conn.row_factory = _sqlite3.Row
+                    cur = conn.cursor()
+                    cur.execute("SELECT name FROM stock_basic WHERE name IS NOT NULL")
+                    for row in cur.fetchall():
+                        name = row["name"]
+                        if not name:
+                            continue
+                        try:
+                            _ = pinyin_initials(str(name))
+                            _ = pinyin_full(str(name))
+                        except Exception:
+                            continue
+                finally:
+                    conn.close()
+            except Exception:
+                # Best-effort only; ignore warmup failures.
+                pass
+
+        yield
+
+    app = FastAPI(title="stock_screener", version="0.1.0", lifespan=_lifespan)
     state = AppState(settings=settings)
     app.state.app_state = state
+
+    # Allow the UI to call same-origin APIs under `/api/*` without requiring a reverse proxy rewrite.
+    app.add_middleware(_StripPrefixMiddleware, prefix="/api")
+
+    # Enable response compression for large payloads (e.g. indicators/longer K-line windows).
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     origins_env = os.environ.get("STOCK_SCREENER_CORS_ORIGINS", "").strip()
     if origins_env:
@@ -211,11 +298,13 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.post("/v1/update", dependencies=[Depends(_api_key_required)])
     def update(req: UpdateRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
         try:
-            update_daily(settings=settings, start=req.start, end=req.end, provider=req.provider, repair_days=req.repair_days)
-        except (TuShareTokenMissing, BaoStockNotConfigured) as e:
+            update_daily_service(settings=settings, start=req.start, end=req.end, provider=req.provider, repair_days=req.repair_days)
+        except (UpdateBadRequest, UpdateNotConfigured) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+        except UpdateIncomplete as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+            raise HTTPException(status_code=500, detail=str(e)) from e
         backend = _backend(settings)
         return {
             "ok": True,
@@ -226,7 +315,10 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.post("/v1/update/wait", response_model=UpdateWaitResponse, dependencies=[Depends(_api_key_required)])
     def update_wait(req: UpdateWaitRequest, settings: Settings = Depends(_settings_dep)) -> UpdateWaitResponse:
         target = req.target_date or format_yyyymmdd(_date.today())
-        parse_yyyymmdd(target)
+        try:
+            parse_yyyymmdd(target)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
         backend = _backend(settings)
         started = time.time()
@@ -235,7 +327,11 @@ def create_app(*, settings: Settings) -> FastAPI:
         while True:
             attempts += 1
             try:
-                update_daily(settings=settings, start=None, end=target, provider=req.provider, repair_days=req.repair_days)
+                update_daily_service(settings=settings, start=None, end=target, provider=req.provider, repair_days=req.repair_days)
+            except (UpdateBadRequest, UpdateNotConfigured) as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except UpdateIncomplete:
+                pass
             except Exception:
                 pass
 
@@ -273,16 +369,24 @@ def create_app(*, settings: Settings) -> FastAPI:
             date_value = str(max_daily)
         else:
             date_value = str(req.date)
-            parse_yyyymmdd(date_value)
+            try:
+                parse_yyyymmdd(date_value)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
 
-        df = run_screen(
-            settings=settings,
-            date=date_value,
-            combo=req.combo,
-            lookback_days=req.lookback_days,
-            rules=req.rules,
-            with_name=req.with_name,
-        )
+        try:
+            df = run_screen(
+                settings=settings,
+                date=date_value,
+                combo=req.combo,
+                lookback_days=req.lookback_days,
+                rules=req.rules,
+                with_name=req.with_name,
+            )
+        except typer.BadParameter as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         return ScreenResponse(trade_date=date_value, hits=df.to_dict(orient="records"))
 
     @app.get("/v1/data/availability", response_model=AvailabilityResponse, dependencies=[Depends(_api_key_required)])
@@ -339,16 +443,24 @@ def create_app(*, settings: Settings) -> FastAPI:
             date_value = str(max_daily)
         else:
             date_value = str(req.date)
-            parse_yyyymmdd(date_value)
+            try:
+                parse_yyyymmdd(date_value)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
 
-        df = run_screen(
-            settings=settings,
-            date=date_value,
-            combo=req.combo,
-            lookback_days=req.lookback_days,
-            rules=req.rules,
-            with_name=False,
-        )
+        try:
+            df = run_screen(
+                settings=settings,
+                date=date_value,
+                combo=req.combo,
+                lookback_days=req.lookback_days,
+                rules=req.rules,
+                with_name=False,
+            )
+        except typer.BadParameter as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         seen: set[str] = set()
         ebk_codes: list[str] = []
         for x in df["ts_code"].astype(str).tolist():
@@ -374,44 +486,134 @@ def create_app(*, settings: Settings) -> FastAPI:
         conn.row_factory = _sqlite3.Row
         try:
             cur = conn.cursor()
-            if search:
-                search_pattern = f"%{search}%"
-                cur.execute(
-                    """
-                    SELECT DISTINCT d.ts_code, sb.name
-                    FROM daily d
-                    LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
-                    WHERE d.ts_code LIKE ? OR sb.name LIKE ?
-                    ORDER BY d.ts_code
-                    LIMIT ? OFFSET ?
-                    """,
-                    (search_pattern, search_pattern, limit, offset),
-                )
-                stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
-                cur.execute(
-                    """
-                    SELECT COUNT(DISTINCT d.ts_code) as cnt
-                    FROM daily d
-                    LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
-                    WHERE d.ts_code LIKE ? OR sb.name LIKE ?
-                    """,
-                    (search_pattern, search_pattern),
-                )
-                total = cur.fetchone()["cnt"]
+            search_raw = (search or "").strip()
+            # Prefer stock_basic for listing/search; scanning DISTINCT over daily is expensive.
+            cur.execute("SELECT 1 FROM stock_basic LIMIT 1")
+            has_stock_basic = cur.fetchone() is not None
+            if not search_raw:
+                if has_stock_basic:
+                    cur.execute(
+                        """
+                        SELECT sb.ts_code, sb.name
+                        FROM stock_basic sb
+                        WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                        ORDER BY sb.ts_code
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+                    stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) as cnt
+                        FROM stock_basic sb
+                        WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                        """
+                    )
+                    total = cur.fetchone()["cnt"]
+                else:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT d.ts_code, sb.name
+                        FROM daily d
+                        LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
+                        ORDER BY d.ts_code
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+                    stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
+                    cur.execute("SELECT COUNT(DISTINCT ts_code) as cnt FROM daily")
+                    total = cur.fetchone()["cnt"]
             else:
-                cur.execute(
-                    """
-                    SELECT DISTINCT d.ts_code, sb.name
-                    FROM daily d
-                    LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
-                    ORDER BY d.ts_code
-                    LIMIT ? OFFSET ?
-                    """,
-                    (limit, offset),
-                )
-                stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
-                cur.execute("SELECT COUNT(DISTINCT ts_code) as cnt FROM daily")
-                total = cur.fetchone()["cnt"]
+                # Pinyin initials search (e.g. "zsyh") for Chinese stock names.
+                search_compact = re.sub(r"\s+", "", search_raw)
+                pinyin_mode = re.fullmatch(r"[A-Za-z]+", search_compact) is not None
+                if pinyin_mode:
+                    search_key = search_compact.lower()
+                    if has_stock_basic:
+                        cur.execute(
+                            """
+                            SELECT sb.ts_code, sb.name
+                            FROM stock_basic sb
+                            WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                            ORDER BY sb.ts_code
+                            """
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT DISTINCT d.ts_code, sb.name
+                            FROM daily d
+                            LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
+                            ORDER BY d.ts_code
+                            """
+                        )
+                    rows = cur.fetchall()
+                    matched: list[StockItem] = []
+                    for row in rows:
+                        ts_code = str(row["ts_code"])
+                        name = row["name"]
+                        if search_key in ts_code.lower():
+                            matched.append(StockItem(ts_code=ts_code, name=name))
+                            continue
+                        if name is None:
+                            continue
+                        name_str = str(name)
+                        initials = pinyin_initials(name_str)
+                        full = pinyin_full(name_str)
+                        if (initials and initials.startswith(search_key)) or (full and full.startswith(search_key)):
+                            matched.append(StockItem(ts_code=ts_code, name=name_str))
+                    total = len(matched)
+                    stocks = matched[offset : offset + limit]
+                else:
+                    search_pattern = f"%{search_raw}%"
+                    if has_stock_basic:
+                        cur.execute(
+                            """
+                            SELECT sb.ts_code, sb.name
+                            FROM stock_basic sb
+                            WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                              AND (sb.ts_code LIKE ? OR sb.name LIKE ?)
+                            ORDER BY sb.ts_code
+                            LIMIT ? OFFSET ?
+                            """,
+                            (search_pattern, search_pattern, limit, offset),
+                        )
+                        stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
+                        cur.execute(
+                            """
+                            SELECT COUNT(*) as cnt
+                            FROM stock_basic sb
+                            WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                              AND (sb.ts_code LIKE ? OR sb.name LIKE ?)
+                            """,
+                            (search_pattern, search_pattern),
+                        )
+                        total = cur.fetchone()["cnt"]
+                    else:
+                        cur.execute(
+                            """
+                            SELECT DISTINCT d.ts_code, sb.name
+                            FROM daily d
+                            LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
+                            WHERE d.ts_code LIKE ? OR sb.name LIKE ?
+                            ORDER BY d.ts_code
+                            LIMIT ? OFFSET ?
+                            """,
+                            (search_pattern, search_pattern, limit, offset),
+                        )
+                        stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
+                        cur.execute(
+                            """
+                            SELECT COUNT(DISTINCT d.ts_code) as cnt
+                            FROM daily d
+                            LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
+                            WHERE d.ts_code LIKE ? OR sb.name LIKE ?
+                            """,
+                            (search_pattern, search_pattern),
+                        )
+                        total = cur.fetchone()["cnt"]
         finally:
             conn.close()
         return StockListResponse(total=total, stocks=stocks)
@@ -492,11 +694,12 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.get("/v1/formulas", response_model=FormulaListResponse, dependencies=[Depends(_api_key_required)])
     def list_formulas(
         enabled_only: bool = Query(default=False, description="Only return enabled formulas"),
+        kind: Literal["screen", "indicator"] | None = Query(default=None, description="Filter by formula kind"),
         settings: Settings = Depends(_settings_dep),
     ) -> FormulaListResponse:
         """List all formulas."""
         backend = _backend(settings)
-        formulas = backend.list_formulas(enabled_only=enabled_only)
+        formulas = backend.list_formulas(enabled_only=enabled_only, kind=kind)
         return FormulaListResponse(
             total=len(formulas),
             formulas=[FormulaItem(**f) for f in formulas],
@@ -526,6 +729,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                 name=req.name,
                 formula=req.formula,
                 description=req.description,
+                kind=req.kind,
+                timeframe=req.timeframe,
                 enabled=req.enabled,
             )
             return FormulaItem(**formula)
@@ -578,6 +783,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                 name=req.name,
                 formula=req.formula,
                 description=req.description,
+                kind=req.kind,
+                timeframe=req.timeframe,
                 enabled=req.enabled,
             )
             return FormulaItem(**formula)
@@ -604,6 +811,138 @@ def create_app(*, settings: Settings) -> FastAPI:
 
         valid, msg = validate_formula(req.formula)
         return FormulaValidateResponse(valid=valid, message=msg)
+
+    @app.get(
+        "/v1/stocks/{ts_code}/indicators/{formula_id}",
+        response_model=IndicatorSeriesResponse,
+        dependencies=[Depends(_api_key_required)],
+    )
+    def get_indicator_series(
+        ts_code: str,
+        formula_id: int,
+        start: str | None = Query(default=None, description="Start date YYYYMMDD"),
+        end: str | None = Query(default=None, description="End date YYYYMMDD"),
+        limit: int = Query(default=250, ge=1, le=2000),
+        settings: Settings = Depends(_settings_dep),
+    ) -> IndicatorSeriesResponse:
+        """Evaluate an indicator formula and return points aligned to daily bars."""
+        if start is not None:
+            try:
+                parse_yyyymmdd(start)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+        if end is not None:
+            try:
+                parse_yyyymmdd(end)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+        backend = _backend(settings)
+        formula = backend.get_formula(formula_id)
+        if not formula or formula.get("kind") != "indicator":
+            raise HTTPException(status_code=404, detail=f"Indicator formula {formula_id} not found")
+
+        timeframe = str(formula.get("timeframe") or "D").upper()
+        if timeframe not in ("D", "W", "M"):
+            raise HTTPException(status_code=400, detail=f"Invalid indicator timeframe: {timeframe}")
+
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(settings.sqlite_path))
+        conn.row_factory = _sqlite3.Row
+        try:
+            cur = conn.cursor()
+            query = "SELECT trade_date, open, high, low, close, vol, amount FROM daily WHERE ts_code = ?"
+            params: list[Any] = [ts_code]
+            if start:
+                query += " AND trade_date >= ?"
+                params.append(start)
+            if end:
+                query += " AND trade_date <= ?"
+                params.append(end)
+            query += " ORDER BY trade_date DESC LIMIT ?"
+            params.append(limit)
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"No data found for {ts_code}")
+
+        daily_df = pd.DataFrame([dict(r) for r in reversed(rows)])
+        daily_df["trade_date"] = daily_df["trade_date"].astype(str)
+
+        def _to_float_or_none(x: Any) -> float | None:
+            if x is None:
+                return None
+            if isinstance(x, bool):
+                return 1.0 if x else 0.0
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return None
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
+
+        def _is_hidden(attrs: list[str]) -> bool:
+            if not attrs:
+                return False
+            if "NODRAW" in attrs:
+                return True
+            return "LINETHICK0" in attrs
+
+        def _build_line_points(trade_dates: list[str], values: list[Any]) -> list[IndicatorPoint]:
+            return [
+                IndicatorPoint(trade_date=td, value=_to_float_or_none(val))
+                for td, val in zip(trade_dates, values, strict=True)
+            ]
+
+        trade_dates = daily_df["trade_date"].tolist()
+
+        if timeframe == "D":
+            outputs = [o for o in execute_formula_outputs(formula["formula"], daily_df) if not _is_hidden(o.draw_attrs)]
+            lines: list[IndicatorLine] = []
+            for i, out in enumerate(outputs, start=1):
+                line_name = out.name or f"output_{i}"
+                values = out.series.reset_index(drop=True).tolist()
+                lines.append(IndicatorLine(name=line_name, points=_build_line_points(trade_dates, values)))
+        else:
+            dt = pd.to_datetime(daily_df["trade_date"], format="%Y%m%d")
+            period = dt.dt.to_period("W-FRI") if timeframe == "W" else dt.dt.to_period("M")
+            tmp = daily_df.copy()
+            tmp["period"] = period
+            agg = (
+                tmp.groupby("period", sort=False)
+                .agg(
+                    open=("open", "first"),
+                    high=("high", "max"),
+                    low=("low", "min"),
+                    close=("close", "last"),
+                    vol=("vol", "sum"),
+                    amount=("amount", "sum"),
+                )
+                .copy()
+            )
+            outputs_period = [o for o in execute_formula_outputs(formula["formula"], agg) if not _is_hidden(o.draw_attrs)]
+            lines = []
+            for i, out in enumerate(outputs_period, start=1):
+                line_name = out.name or f"output_{i}"
+                values = period.map(out.series).tolist()
+                lines.append(IndicatorLine(name=line_name, points=_build_line_points(trade_dates, values)))
+
+        primary_name = str(formula.get("name") or "")
+        primary = next((ln for ln in lines if ln.name == primary_name), None) or (lines[0] if lines else None)
+        points = primary.points if primary is not None else []
+        return IndicatorSeriesResponse(
+            ts_code=ts_code,
+            formula_id=formula_id,
+            name=str(formula["name"]),
+            timeframe=timeframe,  # type: ignore[arg-type]
+            points=points,
+            lines=lines,
+        )
 
     return app
 

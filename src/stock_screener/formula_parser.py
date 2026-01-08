@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import pandas as pd
 
@@ -52,8 +52,31 @@ class FormulaContext:
         self.variables[name.upper()] = value
 
 
+@dataclass(frozen=True)
+class FormulaOutput:
+    name: str | None
+    series: pd.Series
+    draw_attrs: list[str] = field(default_factory=list)
+
+
 class FormulaParser:
     """通达信公式解析器"""
+
+    # 参数位置（0-based）需要为整数常量（N、M 等）
+    INT_PARAMS: dict[str, set[int]] = {
+        "MA": {1},
+        "EMA": {1},
+        "SMA": {1, 2},
+        "REF": {1},
+        "HHV": {1},
+        "LLV": {1},
+        "STD": {1},
+        "SUM": {1},
+        "COUNT": {1},
+        "EVERY": {1},
+        "EXIST": {1},
+        "SLOPE": {1},
+    }
 
     # 支持的函数
     FUNCTIONS: dict[str, Callable] = {
@@ -78,13 +101,29 @@ class FormulaParser:
     }
 
     def __init__(self, formula: str):
-        self.formula = formula.strip()
+        # Remove TongDaXin-style comments: { ... }
+        self.formula = re.sub(r"\{.*?\}", "", formula, flags=re.DOTALL).strip()
         self.pos = 0
         self.length = len(self.formula)
 
-    def parse(self, ctx: FormulaContext) -> pd.Series:
-        """解析并执行公式，返回最后一个表达式的结果"""
-        result = None
+    def parse(
+        self,
+        ctx: FormulaContext,
+        *,
+        prefer_output_name: str | None = None,
+        output_selector: Literal["last", "first"] = "last",
+    ) -> pd.Series:
+        """
+        解析并执行公式并返回结果。
+
+        - 默认返回最后一个输出表达式（更适合筛选公式：通常最后一行是条件）。
+        - 指标绘图场景可通过：
+          - prefer_output_name：优先返回同名输出（例如公式名与首行输出名一致）
+          - output_selector="first"：回退为第一个输出表达式
+        """
+        first_output: pd.Series | None = None
+        last_output: pd.Series | None = None
+        preferred_output: pd.Series | None = None
         statements = self._split_statements(self.formula)
 
         for stmt in statements:
@@ -96,24 +135,44 @@ class FormulaParser:
             if ':=' in stmt:
                 var_name, expr = stmt.split(':=', 1)
                 var_name = var_name.strip()
-                value = self._eval_expr(expr.strip(), ctx)
+                value = self._eval_expr(self._strip_draw_attrs(expr), ctx)
                 ctx.set_var(var_name, value)
             # 检查是否是命名输出语句 (NAME:表达式，但不是 :=)
             elif ':' in stmt and not stmt.startswith(':'):
                 # 找到第一个 : 的位置（排除括号内的）
                 colon_pos = self._find_colon_outside_parens(stmt)
                 if colon_pos > 0:
-                    # 这是命名输出
-                    expr = stmt[colon_pos + 1:].strip()
-                    result = self._eval_expr(expr, ctx)
+                    # TongDaXin 中 NAME:expr 也会产生变量（常用于参数/输出命名）
+                    name = stmt[:colon_pos].strip()
+                    expr = self._strip_draw_attrs(stmt[colon_pos + 1:])
+                    value = self._eval_expr(expr, ctx)
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+                        ctx.set_var(name, value)
+                    if first_output is None:
+                        first_output = value
+                    last_output = value
+                    if prefer_output_name is not None and name == prefer_output_name:
+                        preferred_output = value
                 else:
                     # 普通输出语句
-                    result = self._eval_expr(stmt, ctx)
+                    value = self._eval_expr(self._strip_draw_attrs(stmt), ctx)
+                    if first_output is None:
+                        first_output = value
+                    last_output = value
             else:
                 # 普通输出语句
-                result = self._eval_expr(stmt, ctx)
+                value = self._eval_expr(self._strip_draw_attrs(stmt), ctx)
+                if first_output is None:
+                    first_output = value
+                last_output = value
 
-        return result if result is not None else pd.Series(True, index=ctx.df.index)
+        if preferred_output is not None:
+            return preferred_output
+        if output_selector == "first" and first_output is not None:
+            return first_output
+        if last_output is not None:
+            return last_output
+        return pd.Series(True, index=ctx.df.index)
 
     def _find_colon_outside_parens(self, expr: str) -> int:
         """找到括号外的第一个冒号位置"""
@@ -126,6 +185,74 @@ class FormulaParser:
             elif char == ':' and paren_depth == 0:
                 return i
         return -1
+
+    def _strip_draw_attrs(self, expr: str) -> str:
+        """
+        Strip TongDaXin drawing attributes from an output expression.
+
+        Examples:
+          - "EMA(C,10),COLORRED,LINETHICK2" -> "EMA(C,10)"
+          - "LOW,COLORYELLOW,LINETHICK0" -> "LOW"
+        """
+        expr = expr.strip()
+        paren_depth = 0
+        for i, char in enumerate(expr):
+            if char == '(':
+                paren_depth += 1
+            elif char == ')':
+                paren_depth -= 1
+            elif char == ',' and paren_depth == 0:
+                return expr[:i].strip()
+        return expr
+
+    def _split_draw_attrs(self, expr: str) -> tuple[str, list[str]]:
+        expr = expr.strip()
+        paren_depth = 0
+        for i, char in enumerate(expr):
+            if char == '(':
+                paren_depth += 1
+            elif char == ')':
+                paren_depth -= 1
+            elif char == ',' and paren_depth == 0:
+                main = expr[:i].strip()
+                attrs = [a.strip().upper() for a in expr[i + 1 :].split(",") if a.strip()]
+                return main, attrs
+        return expr, []
+
+    def parse_outputs(self, ctx: FormulaContext) -> list[FormulaOutput]:
+        """解析并执行公式，返回所有输出表达式（含命名输出与绘图属性）。"""
+        outputs: list[FormulaOutput] = []
+        statements = self._split_statements(self.formula)
+
+        for stmt in statements:
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+
+            if ':=' in stmt:
+                var_name, expr = stmt.split(':=', 1)
+                var_name = var_name.strip()
+                expr_main, _attrs = self._split_draw_attrs(expr)
+                value = self._eval_expr(expr_main, ctx)
+                ctx.set_var(var_name, value)
+                continue
+
+            if ':' in stmt and not stmt.startswith(':'):
+                colon_pos = self._find_colon_outside_parens(stmt)
+                if colon_pos > 0:
+                    name = stmt[:colon_pos].strip()
+                    expr_main, attrs = self._split_draw_attrs(stmt[colon_pos + 1 :])
+                    value = self._eval_expr(expr_main, ctx)
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+                        ctx.set_var(name, value)
+                    outputs.append(FormulaOutput(name=name or None, series=value, draw_attrs=attrs))
+                    continue
+
+            expr_main, attrs = self._split_draw_attrs(stmt)
+            value = self._eval_expr(expr_main, ctx)
+            outputs.append(FormulaOutput(name=None, series=value, draw_attrs=attrs))
+
+        return outputs
 
     def _split_statements(self, formula: str) -> list[str]:
         """分割语句（按分号）"""
@@ -259,9 +386,10 @@ class FormulaParser:
                 paren_depth -= 1
             elif paren_depth == 0:
                 if expr_upper[i:i+op_len] == op_upper:
-                    # 对于单字符运算符（+, -, *, /, <, >, =）不需要检查边界
-                    # 对于多字符运算符（AND, OR, >=, <= 等）需要确保不是变量名的一部分
-                    if op_len == 1 and op in '+-*/<>=':
+                    # 符号运算符（例如 >=, <=, <>）允许与变量/数字紧挨；单字符符号同理。
+                    # 仅对单词运算符（AND/OR 等）做边界检查，避免误匹配变量名的一部分。
+                    is_symbol_op = not op_upper.isalpha()
+                    if (op_len == 1 and op in '+-*/<>=') or is_symbol_op:
                         return True
                     else:
                         before_ok = i == 0 or not expr[i-1].isalnum()
@@ -279,6 +407,7 @@ class FormulaParser:
         op_len = len(op)
         expr_upper = expr.upper()
         op_upper = op.upper()
+        is_symbol_op = not op_upper.isalpha()
 
         i = 0
         while i < len(expr):
@@ -290,7 +419,7 @@ class FormulaParser:
                 current.append(expr[i])
             elif paren_depth == 0 and expr_upper[i:i+op_len] == op_upper:
                 # 对于单字符运算符不需要检查边界
-                if op_len == 1 and op in '+-*/<>=':
+                if (op_len == 1 and op in '+-*/<>=') or is_symbol_op:
                     parts.append(''.join(current))
                     current = []
                     i += op_len
@@ -332,6 +461,39 @@ class FormulaParser:
 
         return last_idx
 
+    def _series_from_scalar(self, value: Any, ctx: FormulaContext) -> pd.Series:
+        if isinstance(value, pd.Series):
+            return value
+        if isinstance(value, bool):
+            return pd.Series(bool(value), index=ctx.df.index)
+        if isinstance(value, (int, float)):
+            return pd.Series(value, index=ctx.df.index)
+        raise ValueError(f"无法将参数转换为序列: {value!r}")
+
+    def _int_from_arg(self, value: Any) -> int:
+        if isinstance(value, bool):
+            raise ValueError("参数必须为整数")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            raise ValueError("参数必须为整数")
+        raise ValueError("参数必须为整数")
+
+    def _int_from_series(self, series: pd.Series) -> int:
+        non_null = series.dropna()
+        if non_null.empty:
+            raise ValueError("参数必须为整数")
+        uniq = pd.unique(non_null)
+        if len(uniq) != 1:
+            raise ValueError("参数必须为常量整数")
+        raw = uniq[0]
+        # numpy scalar to python primitive
+        if hasattr(raw, "item"):
+            raw = raw.item()
+        return self._int_from_arg(raw)
+
     def _call_function(self, func_name: str, args_str: str, ctx: FormulaContext) -> pd.Series:
         """调用函数"""
         if func_name not in self.FUNCTIONS:
@@ -340,13 +502,20 @@ class FormulaParser:
         func = self.FUNCTIONS[func_name]
         args = self._parse_args(args_str, ctx)
 
-        # 将数字参数转换为 Series（用于需要 Series 作为第一个参数的函数）
-        # 例如 REF(0, 1) 应该返回常量 0 的序列
-        if args and isinstance(args[0], (int, float)) and not isinstance(args[0], bool):
-            args[0] = pd.Series(args[0], index=ctx.df.index)
+        int_positions = self.INT_PARAMS.get(func_name, set())
+        coerced: list[Any] = []
+        for i, arg in enumerate(args):
+            if i in int_positions:
+                if isinstance(arg, pd.Series):
+                    coerced.append(self._int_from_series(arg))
+                else:
+                    coerced.append(self._int_from_arg(arg))
+            else:
+                # For vectorized functions, numeric literals should behave like constant series.
+                coerced.append(self._series_from_scalar(arg, ctx))
 
         try:
-            return func(*args)
+            return func(*coerced)
         except Exception as e:
             raise ValueError(f"函数 {func_name} 调用失败: {e}")
 
@@ -392,11 +561,24 @@ class FormulaParser:
         return self._eval_expr(arg_str, ctx)
 
 
-def execute_formula(formula: str, df: pd.DataFrame) -> pd.Series:
+def execute_formula(
+    formula: str,
+    df: pd.DataFrame,
+    *,
+    prefer_output_name: str | None = None,
+    output_selector: Literal["last", "first"] = "last",
+) -> pd.Series:
     """执行公式并返回结果"""
     ctx = FormulaContext(df=df)
     parser = FormulaParser(formula)
-    return parser.parse(ctx)
+    return parser.parse(ctx, prefer_output_name=prefer_output_name, output_selector=output_selector)
+
+
+def execute_formula_outputs(formula: str, df: pd.DataFrame) -> list[FormulaOutput]:
+    """执行公式并返回所有输出（用于指标绘图等场景）。"""
+    ctx = FormulaContext(df=df)
+    parser = FormulaParser(formula)
+    return parser.parse_outputs(ctx)
 
 
 def validate_formula(formula: str) -> tuple[bool, str]:

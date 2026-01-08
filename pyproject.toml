@@ -16,6 +16,7 @@ dependencies = [
   "baostock>=0.8",
   "fastapi>=0.110",
   "uvicorn>=0.24",
+  "pypinyin>=0.50",
 ]
 
 [project.optional-dependencies]

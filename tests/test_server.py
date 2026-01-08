@@ -59,3 +59,14 @@ def test_screen_latest(tmp_path: Path) -> None:
     assert body["trade_date"] == "20240131"
     assert isinstance(body["hits"], list)
 
+
+def test_list_stocks_supports_pinyin_initials_search(tmp_path: Path) -> None:
+    settings = _seed_sqlite(tmp_path)
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.get("/v1/stocks", params={"search": "payh", "limit": 50, "offset": 0})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] >= 1
+    assert any(s["ts_code"] == "000001.SZ" for s in body["stocks"])

@@ -83,16 +83,26 @@ def run_screen(
         cols.j,
         cols.rules,
     ]
+
+    def _ensure_col(frame: pd.DataFrame, col: str) -> None:
+        if col in frame.columns:
+            return
+        frame[col] = pd.Series([None] * len(frame), dtype="object")
+
+    for col in (cols.ma60, cols.mid_bullbear, cols.j):
+        _ensure_col(hits, col)
+
     if with_name:
         base_cols.insert(2, cols.name)
-        if hits.empty:
-            hits[cols.name] = pd.Series(dtype="string")
-        else:
+        _ensure_col(hits, cols.name)
+        if not hits.empty:
             name_map = backend.load_stock_names(hits["ts_code"].astype(str).unique().tolist())
-            hits[cols.name] = hits["ts_code"].astype(str).map(name_map)
+            names = hits["ts_code"].astype(str).map(name_map)
+            hits[cols.name] = names.astype(object).where(names.notna(), None)
 
     if hits.empty:
-        return hits.assign(rules=pd.Series(dtype="string"))[base_cols]
+        hits[cols.rules] = pd.Series(dtype="string")
+        return hits[base_cols]
 
     def _rules_for_row(idx: int) -> str:
         matched = [name for name, m in masks.items() if bool(m.loc[idx])]
@@ -100,4 +110,6 @@ def run_screen(
 
     hits["rules"] = [_rules_for_row(i) for i in hits.index]
     out = hits[base_cols].sort_values([cols.trade_date, cols.ts_code], kind="mergesort")
+    # Avoid NaN/Infinity that may break JSON responses.
+    out = out.where(pd.notna(out), None)
     return out.reset_index(drop=True)

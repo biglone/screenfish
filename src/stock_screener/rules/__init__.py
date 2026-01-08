@@ -37,7 +37,7 @@ def resolve_rules(names: str | None, backend: "SqliteBackend | None" = None) -> 
     if not names:
         if backend is None:
             return builtin
-        formulas = backend.list_formulas(enabled_only=True)
+        formulas = backend.list_formulas(enabled_only=True, kind="screen")
         if not formulas:
             return builtin
         return [FormulaRule(name=f["name"], formula=f["formula"]) for f in formulas]
@@ -60,6 +60,8 @@ def resolve_rules(names: str | None, backend: "SqliteBackend | None" = None) -> 
             formula = backend.get_formula_by_name(formula_name)
             if not formula:
                 raise ValueError(f"未知公式: {formula_name}")
+            if formula.get("kind") != "screen":
+                raise ValueError(f"公式 '{formula_name}' 不是筛选类型")
             result.append(FormulaRule(name=formula["name"], formula=formula["formula"]))
             continue
 
@@ -71,6 +73,8 @@ def resolve_rules(names: str | None, backend: "SqliteBackend | None" = None) -> 
             formula = backend.get_formula(formula_id)
             if not formula:
                 raise ValueError(f"未知公式 ID: {formula_id}")
+            if formula.get("kind") != "screen":
+                raise ValueError(f"公式 ID {formula_id} 不是筛选类型")
             result.append(FormulaRule(name=formula["name"], formula=formula["formula"]))
             continue
 
@@ -78,6 +82,8 @@ def resolve_rules(names: str | None, backend: "SqliteBackend | None" = None) -> 
         if backend is not None:
             formula = backend.get_formula_by_name(name)
             if formula:
+                if formula.get("kind") != "screen":
+                    raise ValueError(f"公式 '{name}' 不是筛选类型")
                 result.append(FormulaRule(name=formula["name"], formula=formula["formula"]))
                 continue
 
@@ -86,4 +92,3 @@ def resolve_rules(names: str | None, backend: "SqliteBackend | None" = None) -> 
         raise ValueError(f"未知规则: {name}; 可用的内置规则: {available}")
 
     return result
-

@@ -14,6 +14,22 @@ from stock_screener.providers.tushare_provider import TuShareTokenMissing
 from stock_screener.tushare_client import TuShareNotConfigured
 
 
+class UpdateError(Exception):
+    pass
+
+
+class UpdateBadRequest(UpdateError):
+    pass
+
+
+class UpdateNotConfigured(UpdateError):
+    pass
+
+
+class UpdateIncomplete(UpdateError):
+    pass
+
+
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -28,30 +44,39 @@ def _resolve_start_end(
     repair_days: int,
 ) -> tuple[str, str]:
     end_eff = end or format_yyyymmdd(_date.today())
-    parse_yyyymmdd(end_eff)
+    try:
+        parse_yyyymmdd(end_eff)
+    except ValueError as e:
+        raise UpdateBadRequest(str(e)) from e
 
     if start is not None:
-        parse_yyyymmdd(start)
-        if parse_yyyymmdd(start) > parse_yyyymmdd(end_eff):
-            raise typer.BadParameter("start must be <= end")
+        try:
+            start_parsed = parse_yyyymmdd(start)
+        except ValueError as e:
+            raise UpdateBadRequest(str(e)) from e
+        if start_parsed > parse_yyyymmdd(end_eff):
+            raise UpdateBadRequest("start must be <= end")
         return start, end_eff
 
     # Auto mode: choose a recent lookback window to both fetch "latest" and repair gaps.
     last = backend.max_trade_date_in_update_log() or backend.max_trade_date_in_daily()
     if not last:
-        raise typer.BadParameter("no local cache found; please specify --start for the first update")
-    parse_yyyymmdd(last)
+        raise UpdateBadRequest("no local cache found; please specify --start for the first update")
+    try:
+        parse_yyyymmdd(last)
+    except ValueError as e:
+        raise UpdateBadRequest(str(e)) from e
     if repair_days < 0:
-        raise typer.BadParameter("repair-days must be >= 0")
+        raise UpdateBadRequest("repair-days must be >= 0")
     start_eff = subtract_calendar_days(last, repair_days)
     if parse_yyyymmdd(start_eff) > parse_yyyymmdd(end_eff):
         start_eff = end_eff
     return start_eff, end_eff
 
 
-def update_daily(*, settings: Settings, start: str | None, end: str | None, provider: str, repair_days: int) -> None:
+def update_daily_service(*, settings: Settings, start: str | None, end: str | None, provider: str, repair_days: int) -> None:
     if settings.data_backend != "sqlite":
-        raise typer.BadParameter("only sqlite backend is implemented")
+        raise UpdateBadRequest("only sqlite backend is implemented")
 
     backend = SqliteBackend(settings.sqlite_path)
     backend.init()
@@ -61,10 +86,9 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
         p = get_provider(provider)
         open_dates = p.open_trade_dates(start=start_eff, end=end_eff)
     except (TuShareNotConfigured, BaoStockNotConfigured) as e:
-        typer.echo(str(e), err=True)
-        raise typer.Exit(code=2) from e
+        raise UpdateNotConfigured(str(e)) from e
     except (TuShareTokenMissing, ValueError) as e:
-        raise typer.BadParameter(str(e)) from e
+        raise UpdateBadRequest(str(e)) from e
 
     updated = backend.get_updated_trade_dates(open_dates)
     missing = [d for d in open_dates if d not in updated]
@@ -117,7 +141,7 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
                     codes = p._all_stock_codes(bs=bs, day=fallback_day)
             if not codes:
                 typer.echo(f"error: empty stock list; cannot update {range_start}..{range_end}", err=True)
-                raise typer.Exit(code=2)
+                raise UpdateNotConfigured(f"empty stock list; cannot update {range_start}..{range_end}")
 
             # Sync stock names
             _sync_stock_names(bs, range_end)
@@ -179,8 +203,7 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
         progress = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
         completed = len(progress & target_ts_codes)
         if completed < len(target_ts_codes):
-            typer.echo(f"incomplete: completed {completed}/{len(target_ts_codes)} stocks; rerun to resume", err=True)
-            raise typer.Exit(code=1)
+            raise UpdateIncomplete(f"incomplete: completed {completed}/{len(target_ts_codes)} stocks; rerun to resume")
 
         dates_with_rows = [d for d in missing_sorted if backend.count_daily_rows_for_trade_date(d) > 0]
         if not dates_with_rows:
@@ -189,7 +212,9 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
                 f"no daily rows for {range_start}..{range_end}; provider may not have published data yet, please rerun later",
                 err=True,
             )
-            raise typer.Exit(code=1)
+            raise UpdateIncomplete(
+                f"no daily rows for {range_start}..{range_end}; provider may not have published data yet, please rerun later"
+            )
 
         with backend.connect() as conn:
             for d in dates_with_rows:
@@ -198,9 +223,29 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
         if len(dates_with_rows) != len(missing_sorted):
             backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
             remaining = [d for d in missing_sorted if d not in dates_with_rows]
-            typer.echo(f"partial update; remaining dates: {remaining}; rerun to resume", err=True)
-            raise typer.Exit(code=1)
+            raise UpdateIncomplete(f"partial update; remaining dates: {remaining}; rerun to resume")
         typer.echo("done")
         return
 
-    raise typer.BadParameter("unknown provider")
+    raise UpdateBadRequest("unknown provider")
+
+
+def update_daily(*, settings: Settings, start: str | None, end: str | None, provider: str, repair_days: int) -> None:
+    """
+    CLI-friendly wrapper.
+
+    It preserves Click/Typer exit codes and error types, while the core implementation
+    (`update_daily_service`) is safe to be used by the REST API without raising Typer-specific
+    exceptions that would otherwise map poorly to HTTP responses.
+    """
+
+    try:
+        update_daily_service(settings=settings, start=start, end=end, provider=provider, repair_days=repair_days)
+    except UpdateBadRequest as e:
+        raise typer.BadParameter(str(e)) from e
+    except UpdateNotConfigured as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=2) from e
+    except UpdateIncomplete as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
