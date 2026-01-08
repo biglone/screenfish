@@ -4,6 +4,8 @@ import math
 import os
 import re
 import time
+import uuid
+from hashlib import sha256
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date as _date
@@ -32,6 +34,15 @@ def _api_key_required(x_api_key: str | None = Header(default=None)) -> None:
         return
     if not x_api_key or x_api_key != required:
         raise HTTPException(status_code=401, detail="missing/invalid X-API-Key")
+
+
+def _watchlist_owner_id(x_api_key: str | None = Header(default=None)) -> str:
+    required = os.environ.get("STOCK_SCREENER_API_KEY")
+    if required:
+        if not x_api_key or x_api_key != required:
+            raise HTTPException(status_code=401, detail="missing/invalid X-API-Key")
+        return sha256(x_api_key.encode("utf-8")).hexdigest()
+    return "public"
 
 
 class StatusResponse(BaseModel):
@@ -113,6 +124,43 @@ class StockDailyResponse(BaseModel):
     ts_code: str
     name: str | None = None
     bars: list[DailyBar]
+
+
+class WatchlistItem(BaseModel):
+    ts_code: str
+    name: str | None = None
+
+
+class WatchlistGroupMeta(BaseModel):
+    id: str
+    name: str
+    created_at: int
+    updated_at: int
+
+
+class WatchlistGroup(WatchlistGroupMeta):
+    items: list[WatchlistItem] = Field(default_factory=list)
+
+
+class WatchlistStateResponse(BaseModel):
+    version: int = 1
+    groups: list[WatchlistGroup] = Field(default_factory=list)
+
+
+class WatchlistGroupCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=30)
+
+
+class WatchlistGroupUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=30)
+
+
+class WatchlistItemsUpsertRequest(BaseModel):
+    items: list[WatchlistItem] = Field(..., min_length=1)
+
+
+class WatchlistItemsRemoveRequest(BaseModel):
+    ts_codes: list[str] = Field(..., min_length=1)
 
 
 class FormulaItem(BaseModel):
@@ -688,6 +736,261 @@ def create_app(*, settings: Settings) -> FastAPI:
                 return {"ok": False, "synced": 0, "message": "no stock basics returned"}
             backend.upsert_stock_basic_df(basics_df)
             return {"ok": True, "synced": len(basics_df), "message": f"synced {len(basics_df)} stock names"}
+
+    # Watchlist endpoints (groups + items)
+
+    def _normalize_watchlist_group_name(name: str) -> str:
+        return re.sub(r"\s+", " ", name.strip())[:30]
+
+    def _ensure_default_watchlist_group(conn: Any, owner_id: str) -> None:
+        row = conn.execute(
+            "SELECT 1 FROM watchlist_groups WHERE owner_id = ? LIMIT 1",
+            (owner_id,),
+        ).fetchone()
+        if row:
+            return
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO watchlist_groups (owner_id, id, name, created_at, updated_at)
+            VALUES (?, 'default', '自选', ?, ?)
+            """,
+            (owner_id, now, now),
+        )
+
+    @app.get(
+        "/v1/watchlist",
+        response_model=WatchlistStateResponse,
+        dependencies=[Depends(_api_key_required)],
+    )
+    def get_watchlist(
+        settings: Settings = Depends(_settings_dep),
+        owner_id: str = Depends(_watchlist_owner_id),
+    ) -> WatchlistStateResponse:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            _ensure_default_watchlist_group(conn, owner_id)
+            group_rows = conn.execute(
+                """
+                SELECT id, name, created_at, updated_at
+                FROM watchlist_groups
+                WHERE owner_id = ?
+                ORDER BY updated_at DESC, created_at DESC
+                """,
+                (owner_id,),
+            ).fetchall()
+
+            items_by_group: dict[str, list[WatchlistItem]] = {}
+            item_rows = conn.execute(
+                """
+                SELECT
+                  i.group_id AS group_id,
+                  i.ts_code AS ts_code,
+                  COALESCE(i.name, sb.name) AS name
+                FROM watchlist_items i
+                LEFT JOIN stock_basic sb ON sb.ts_code = i.ts_code
+                WHERE i.owner_id = ?
+                ORDER BY i.group_id ASC, i.updated_at DESC, i.ts_code ASC
+                """,
+                (owner_id,),
+            ).fetchall()
+            for row in item_rows:
+                gid = str(row["group_id"])
+                items_by_group.setdefault(gid, []).append(
+                    WatchlistItem(ts_code=str(row["ts_code"]), name=row["name"])
+                )
+
+            groups = [
+                WatchlistGroup(
+                    id=str(row["id"]),
+                    name=str(row["name"]),
+                    created_at=int(row["created_at"]),
+                    updated_at=int(row["updated_at"]),
+                    items=items_by_group.get(str(row["id"]), []),
+                )
+                for row in group_rows
+            ]
+            return WatchlistStateResponse(version=1, groups=groups)
+
+    @app.post(
+        "/v1/watchlist/groups",
+        response_model=WatchlistGroupMeta,
+        dependencies=[Depends(_api_key_required)],
+    )
+    def create_watchlist_group(
+        req: WatchlistGroupCreate,
+        settings: Settings = Depends(_settings_dep),
+        owner_id: str = Depends(_watchlist_owner_id),
+    ) -> WatchlistGroupMeta:
+        name = _normalize_watchlist_group_name(req.name)
+        if not name:
+            raise HTTPException(status_code=400, detail="group name is required")
+        group_id = uuid.uuid4().hex
+        now = int(time.time())
+
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            _ensure_default_watchlist_group(conn, owner_id)
+            conn.execute(
+                """
+                INSERT INTO watchlist_groups (owner_id, id, name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (owner_id, group_id, name, now, now),
+            )
+        return WatchlistGroupMeta(id=group_id, name=name, created_at=now, updated_at=now)
+
+    @app.put(
+        "/v1/watchlist/groups/{group_id}",
+        response_model=WatchlistGroupMeta,
+        dependencies=[Depends(_api_key_required)],
+    )
+    def update_watchlist_group(
+        group_id: str,
+        req: WatchlistGroupUpdate,
+        settings: Settings = Depends(_settings_dep),
+        owner_id: str = Depends(_watchlist_owner_id),
+    ) -> WatchlistGroupMeta:
+        name = _normalize_watchlist_group_name(req.name)
+        if not name:
+            raise HTTPException(status_code=400, detail="group name is required")
+        now = int(time.time())
+
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT id, created_at FROM watchlist_groups WHERE owner_id = ? AND id = ?",
+                (owner_id, group_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"watchlist group {group_id} not found")
+            created_at = int(row["created_at"])
+            conn.execute(
+                "UPDATE watchlist_groups SET name = ?, updated_at = ? WHERE owner_id = ? AND id = ?",
+                (name, now, owner_id, group_id),
+            )
+        return WatchlistGroupMeta(id=group_id, name=name, created_at=created_at, updated_at=now)
+
+    @app.delete(
+        "/v1/watchlist/groups/{group_id}",
+        dependencies=[Depends(_api_key_required)],
+    )
+    def delete_watchlist_group(
+        group_id: str,
+        settings: Settings = Depends(_settings_dep),
+        owner_id: str = Depends(_watchlist_owner_id),
+    ) -> dict[str, Any]:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM watchlist_groups WHERE owner_id = ? AND id = ?",
+                (owner_id, group_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"watchlist group {group_id} not found")
+
+            conn.execute(
+                "DELETE FROM watchlist_items WHERE owner_id = ? AND group_id = ?",
+                (owner_id, group_id),
+            )
+            conn.execute(
+                "DELETE FROM watchlist_groups WHERE owner_id = ? AND id = ?",
+                (owner_id, group_id),
+            )
+            _ensure_default_watchlist_group(conn, owner_id)
+        return {"ok": True, "deleted": group_id}
+
+    @app.post(
+        "/v1/watchlist/groups/{group_id}/items",
+        dependencies=[Depends(_api_key_required)],
+    )
+    def upsert_watchlist_items(
+        group_id: str,
+        req: WatchlistItemsUpsertRequest,
+        settings: Settings = Depends(_settings_dep),
+        owner_id: str = Depends(_watchlist_owner_id),
+    ) -> dict[str, Any]:
+        items = req.items or []
+        if not items:
+            raise HTTPException(status_code=400, detail="items is required")
+        now = int(time.time())
+
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM watchlist_groups WHERE owner_id = ? AND id = ?",
+                (owner_id, group_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"watchlist group {group_id} not found")
+
+            conn.executemany(
+                """
+                INSERT INTO watchlist_items (owner_id, group_id, ts_code, name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_id, group_id, ts_code) DO UPDATE SET
+                  name = COALESCE(excluded.name, watchlist_items.name),
+                  updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        owner_id,
+                        group_id,
+                        str(item.ts_code).strip(),
+                        item.name,
+                        now,
+                        now,
+                    )
+                    for item in items
+                    if str(item.ts_code).strip()
+                ],
+            )
+            conn.execute(
+                "UPDATE watchlist_groups SET updated_at = ? WHERE owner_id = ? AND id = ?",
+                (now, owner_id, group_id),
+            )
+            total = conn.execute(
+                "SELECT COUNT(1) AS c FROM watchlist_items WHERE owner_id = ? AND group_id = ?",
+                (owner_id, group_id),
+            ).fetchone()["c"]
+        return {"ok": True, "group_id": group_id, "updated_at": now, "total": int(total)}
+
+    @app.post(
+        "/v1/watchlist/groups/{group_id}/items/remove",
+        dependencies=[Depends(_api_key_required)],
+    )
+    def remove_watchlist_items(
+        group_id: str,
+        req: WatchlistItemsRemoveRequest,
+        settings: Settings = Depends(_settings_dep),
+        owner_id: str = Depends(_watchlist_owner_id),
+    ) -> dict[str, Any]:
+        ts_codes = [c.strip() for c in (req.ts_codes or []) if c and c.strip()]
+        if not ts_codes:
+            raise HTTPException(status_code=400, detail="ts_codes is required")
+        now = int(time.time())
+
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM watchlist_groups WHERE owner_id = ? AND id = ?",
+                (owner_id, group_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"watchlist group {group_id} not found")
+
+            placeholders = ",".join(["?"] * len(ts_codes))
+            params: list[Any] = [owner_id, group_id, *ts_codes]
+            cur = conn.execute(
+                f"DELETE FROM watchlist_items WHERE owner_id = ? AND group_id = ? AND ts_code IN ({placeholders})",
+                params,
+            )
+            conn.execute(
+                "UPDATE watchlist_groups SET updated_at = ? WHERE owner_id = ? AND id = ?",
+                (now, owner_id, group_id),
+            )
+            removed = cur.rowcount
+        return {"ok": True, "group_id": group_id, "updated_at": now, "removed": int(removed)}
 
     # Formula CRUD endpoints
 

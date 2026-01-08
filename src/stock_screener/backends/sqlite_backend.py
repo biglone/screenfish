@@ -65,6 +65,29 @@ class SqliteBackend:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS watchlist_groups (
+                  owner_id TEXT NOT NULL,
+                  id TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY (owner_id, id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_watchlist_groups_owner_updated_at
+                  ON watchlist_groups (owner_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS watchlist_items (
+                  owner_id TEXT NOT NULL,
+                  group_id TEXT NOT NULL,
+                  ts_code TEXT NOT NULL,
+                  name TEXT,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY (owner_id, group_id, ts_code)
+                );
+                CREATE INDEX IF NOT EXISTS idx_watchlist_items_owner_group_updated_at
+                  ON watchlist_items (owner_id, group_id, updated_at DESC);
                 """
             )
             self._migrate(conn)
