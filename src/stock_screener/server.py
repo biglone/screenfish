@@ -911,8 +911,22 @@ def create_app(*, settings: Settings) -> FastAPI:
         owner_id: str = Depends(_watchlist_owner_id),
     ) -> dict[str, Any]:
         items = req.items or []
-        if not items:
+        raw_ts_codes = [str(i.ts_code).strip() for i in items if str(i.ts_code).strip()]
+        if not raw_ts_codes:
             raise HTTPException(status_code=400, detail="items is required")
+
+        ts_codes: list[str] = []
+        seen: set[str] = set()
+        for c in raw_ts_codes:
+            norm = c.upper()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            ts_codes.append(norm)
+
+        invalid_format = [c for c in ts_codes if re.fullmatch(r"\d{6}\.(SZ|SH|BJ)", c) is None]
+        if invalid_format:
+            raise HTTPException(status_code=400, detail=f"invalid ts_code: {invalid_format[0]}")
         now = int(time.time())
 
         backend = _backend(settings)
@@ -923,6 +937,30 @@ def create_app(*, settings: Settings) -> FastAPI:
             ).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail=f"watchlist group {group_id} not found")
+
+            placeholders = ",".join(["?"] * len(ts_codes))
+            valid_rows = conn.execute(
+                f"SELECT DISTINCT ts_code FROM daily WHERE ts_code IN ({placeholders})",
+                ts_codes,
+            ).fetchall()
+            valid_ts_codes = {str(r["ts_code"]) for r in valid_rows}
+            missing = [c for c in ts_codes if c not in valid_ts_codes]
+            if missing:
+                sample = ", ".join(missing[:10])
+                more = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"
+                raise HTTPException(status_code=400, detail=f"unknown ts_code(s): {sample}{more}")
+
+            name_by_code: dict[str, str | None] = {}
+            for item in items:
+                code = str(item.ts_code).strip()
+                if not code:
+                    continue
+                norm = code.upper()
+                if norm not in valid_ts_codes:
+                    continue
+                if norm in name_by_code:
+                    continue
+                name_by_code[norm] = item.name
 
             conn.executemany(
                 """
@@ -936,13 +974,12 @@ def create_app(*, settings: Settings) -> FastAPI:
                     (
                         owner_id,
                         group_id,
-                        str(item.ts_code).strip(),
-                        item.name,
+                        ts_code,
+                        name_by_code.get(ts_code),
                         now,
                         now,
                     )
-                    for item in items
-                    if str(item.ts_code).strip()
+                    for ts_code in ts_codes
                 ],
             )
             conn.execute(
@@ -965,7 +1002,14 @@ def create_app(*, settings: Settings) -> FastAPI:
         settings: Settings = Depends(_settings_dep),
         owner_id: str = Depends(_watchlist_owner_id),
     ) -> dict[str, Any]:
-        ts_codes = [c.strip() for c in (req.ts_codes or []) if c and c.strip()]
+        raw_ts_codes = [str(c).strip() for c in (req.ts_codes or []) if c and str(c).strip()]
+        ts_codes: list[str] = []
+        seen: set[str] = set()
+        for c in raw_ts_codes:
+            if c in seen:
+                continue
+            seen.add(c)
+            ts_codes.append(c)
         if not ts_codes:
             raise HTTPException(status_code=400, detail="ts_codes is required")
         now = int(time.time())
