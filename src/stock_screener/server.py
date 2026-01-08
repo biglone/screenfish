@@ -3,12 +3,15 @@ from __future__ import annotations
 import math
 import os
 import re
+import shutil
+import subprocess
 import time
 import uuid
 from hashlib import sha256
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date as _date
+from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
@@ -34,6 +37,69 @@ def _api_key_required(x_api_key: str | None = Header(default=None)) -> None:
         return
     if not x_api_key or x_api_key != required:
         raise HTTPException(status_code=401, detail="missing/invalid X-API-Key")
+
+
+def _admin_token_required(x_admin_token: str | None = Header(default=None)) -> None:
+    enabled_raw = os.environ.get("STOCK_SCREENER_ENABLE_LOGS_API", "").strip().lower()
+    enabled = enabled_raw in {"1", "true", "yes", "y", "on"}
+    token = os.environ.get("STOCK_SCREENER_ADMIN_TOKEN", "").strip()
+    if not enabled or not token:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not x_admin_token or x_admin_token != token:
+        raise HTTPException(status_code=401, detail="missing/invalid X-Admin-Token")
+
+
+def _tail_text_file(path: Path, *, max_lines: int, max_bytes: int = 256_000) -> list[str]:
+    if max_lines <= 0:
+        return []
+    if not path.exists():
+        return []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+
+    start = max(0, size - max_bytes)
+    try:
+        with path.open("rb") as f:
+            if start:
+                f.seek(start)
+            data = f.read()
+    except OSError:
+        return []
+
+    text = data.decode("utf-8", errors="replace")
+    if start:
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1 :]
+        else:
+            text = ""
+    lines = text.splitlines()
+    return lines[-max_lines:]
+
+
+def _tail_journald_user_unit(unit: str, *, max_lines: int) -> list[str]:
+    if max_lines <= 0:
+        return []
+    if shutil.which("journalctl") is None:
+        return []
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    cmd = [
+        "journalctl",
+        "--user-unit",
+        unit,
+        "-n",
+        str(max_lines),
+        "--no-pager",
+        "--output",
+        "short-iso",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=2)
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or "").strip() or "journalctl failed")
+    return (res.stdout or "").splitlines()
 
 
 def _watchlist_owner_id(x_api_key: str | None = Header(default=None)) -> str:
@@ -161,6 +227,13 @@ class WatchlistItemsUpsertRequest(BaseModel):
 
 class WatchlistItemsRemoveRequest(BaseModel):
     ts_codes: list[str] = Field(..., min_length=1)
+
+
+class LogTailResponse(BaseModel):
+    source: Literal["journald", "file", "none"]
+    unit: str | None = None
+    path: str | None = None
+    lines: list[str] = Field(default_factory=list)
 
 
 class FormulaItem(BaseModel):
@@ -315,6 +388,26 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.get("/v1/health", dependencies=[Depends(_api_key_required)])
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get(
+        "/v1/admin/logs/backend",
+        response_model=LogTailResponse,
+        dependencies=[Depends(_admin_token_required)],
+    )
+    def get_backend_logs(lines: int = Query(default=200, ge=1, le=2000)) -> LogTailResponse:
+        log_file = os.environ.get("STOCK_SCREENER_LOG_FILE", "").strip()
+        if log_file:
+            path = Path(log_file).expanduser()
+            return LogTailResponse(source="file", path=str(path), lines=_tail_text_file(path, max_lines=lines))
+
+        unit = os.environ.get("STOCK_SCREENER_LOG_UNIT", "").strip() or "screenfish-backend.service"
+        try:
+            out = _tail_journald_user_unit(unit, max_lines=lines)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        if not out:
+            return LogTailResponse(source="none", unit=unit, lines=[])
+        return LogTailResponse(source="journald", unit=unit, lines=out[-lines:])
 
     @app.get("/v1/status", response_model=StatusResponse, dependencies=[Depends(_api_key_required)])
     def status(settings: Settings = Depends(_settings_dep)) -> StatusResponse:
