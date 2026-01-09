@@ -1382,7 +1382,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         ts_code: str,
         start: str | None = Query(default=None, description="Start date YYYYMMDD"),
         end: str | None = Query(default=None, description="End date YYYYMMDD"),
-        limit: int = Query(default=250, ge=1, le=1000),
+        limit: int = Query(default=250, ge=1, le=20000),
         settings: Settings = Depends(_settings_dep),
     ) -> StockDailyResponse:
         start_parsed = None
@@ -1890,7 +1890,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         formula_id: int,
         start: str | None = Query(default=None, description="Start date YYYYMMDD"),
         end: str | None = Query(default=None, description="End date YYYYMMDD"),
-        limit: int = Query(default=250, ge=1, le=2000),
+        limit: int = Query(default=250, ge=1, le=20000),
         settings: Settings = Depends(_settings_dep),
     ) -> IndicatorSeriesResponse:
         """Evaluate an indicator formula and return points aligned to daily bars."""
