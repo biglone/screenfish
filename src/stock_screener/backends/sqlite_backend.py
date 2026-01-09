@@ -120,6 +120,22 @@ class SqliteBackend:
                 );
                 CREATE INDEX IF NOT EXISTS idx_email_verification_codes_expires_at
                   ON email_verification_codes (expires_at);
+
+                CREATE TABLE IF NOT EXISTS auto_update_config (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  enabled INTEGER NOT NULL DEFAULT 0,
+                  interval_seconds INTEGER NOT NULL DEFAULT 600,
+                  provider TEXT NOT NULL DEFAULT 'baostock',
+                  repair_days INTEGER NOT NULL DEFAULT 30,
+                  last_run_at INTEGER,
+                  last_success_at INTEGER,
+                  last_success_trade_date TEXT,
+                  last_error TEXT,
+                  updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO auto_update_config
+                  (id, enabled, interval_seconds, provider, repair_days, updated_at)
+                VALUES (1, 0, 600, 'baostock', 30, 0);
                 """
             )
             self._migrate(conn)

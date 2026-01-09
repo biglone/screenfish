@@ -187,6 +187,13 @@ class UpdateWaitResponse(BaseModel):
     last_error: str | None = None
 
 
+class AutoUpdateConfig(BaseModel):
+    enabled: bool = False
+    interval_seconds: int = Field(default=600, ge=1)
+    provider: Literal["baostock", "tushare"] = "baostock"
+    repair_days: int = Field(default=30, ge=0)
+
+
 class ScreenRequest(BaseModel):
     date: str | Literal["latest"] = "latest"
     combo: Literal["and", "or"] = "and"
@@ -1535,6 +1542,49 @@ def create_app(*, settings: Settings) -> FastAPI:
             stocks=total_stocks,
             rows=total_rows,
         )
+
+    @app.get("/auto-update-config", response_model=AutoUpdateConfig, dependencies=[Depends(_admin_required)])
+    def get_auto_update_config(settings: Settings = Depends(_settings_dep)) -> AutoUpdateConfig:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+            row = conn.execute(
+                "SELECT enabled, interval_seconds, provider, repair_days FROM auto_update_config WHERE id = 1 LIMIT 1"
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="auto_update_config missing")
+
+        provider = str(row["provider"] or "baostock")
+        if provider not in {"baostock", "tushare"}:
+            provider = "baostock"
+        interval_seconds = int(row["interval_seconds"] or 600)
+        if interval_seconds < 1:
+            interval_seconds = 600
+        repair_days = int(row["repair_days"] or 30)
+        if repair_days < 0:
+            repair_days = 30
+        return AutoUpdateConfig(
+            enabled=bool(int(row["enabled"] or 0)),
+            interval_seconds=interval_seconds,
+            provider=provider,  # type: ignore[arg-type]
+            repair_days=repair_days,
+        )
+
+    @app.put("/auto-update-config", response_model=AutoUpdateConfig, dependencies=[Depends(_admin_required)])
+    def update_auto_update_config(req: AutoUpdateConfig, settings: Settings = Depends(_settings_dep)) -> AutoUpdateConfig:
+        backend = _backend(settings)
+        now = int(time.time())
+        with backend.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+            conn.execute(
+                """
+                UPDATE auto_update_config
+                SET enabled = ?, interval_seconds = ?, provider = ?, repair_days = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (1 if req.enabled else 0, req.interval_seconds, req.provider, req.repair_days, now),
+            )
+        return get_auto_update_config(settings=settings)
 
     @app.post("/v1/update", dependencies=[Depends(_admin_required)])
     def update(req: UpdateRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
