@@ -1,0 +1,13 @@
+[Unit]
+Description=stock_screener daily updater
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/stock_screener
+Environment=STOCK_SCREENER_CACHE_DIR=/opt/stock_screener/data
+Environment=STOCK_SCREENER_UPDATE_PROVIDER=baostock
+Environment=STOCK_SCREENER_UPDATE_REPAIR_DAYS=30
+# Environment=TUSHARE_TOKEN=...
+ExecStart=/opt/stock_screener/.venv/bin/stock_screener update --provider ${STOCK_SCREENER_UPDATE_PROVIDER} --cache ${STOCK_SCREENER_CACHE_DIR} --repair-days ${STOCK_SCREENER_UPDATE_REPAIR_DAYS}
+

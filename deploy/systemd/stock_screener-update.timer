@@ -1,0 +1,12 @@
+[Unit]
+Description=Run stock_screener update daily
+
+[Timer]
+OnCalendar=*-*-* 16:30:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=stock_screener-update.service
+
+[Install]
+WantedBy=timers.target
+

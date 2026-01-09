@@ -146,8 +146,12 @@ KDJ 中 `RSV = (CLOSE-LLV(LOW,N))/(HHV(HIGH,N)-LLV(LOW,N))*100`：
 ## 自动化建议
 
 可用 `cron`/任务计划每天运行：
-1) `stock_screener update --start {最近N天} --end {今天}`
+1) `stock_screener update`（自动回看修补最近缺口并更新到今天）
 2) `stock_screener run --date {今天} --out results.csv`
+
+Linux（systemd）可直接使用定时器示例（每日更新一次）：
+- 复制 `deploy/systemd/stock_screener-update.service` 与 `deploy/systemd/stock_screener-update.timer` 到 `/etc/systemd/system/`
+- 启用：`sudo systemctl daemon-reload && sudo systemctl enable --now stock_screener-update.timer`
 
 ## 后台服务（REST API）
 
