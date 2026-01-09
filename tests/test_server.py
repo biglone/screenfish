@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -31,6 +32,29 @@ def _seed_sqlite(cache_dir: Path) -> Settings:
     backend.upsert_daily_df(df)
     backend.mark_trade_date_updated("20240131")
     backend.upsert_stock_basic_df(pd.DataFrame([{"ts_code": "000001.SZ", "name": "平安银行"}]))
+    return settings
+
+
+def _seed_sqlite_one_day(cache_dir: Path, trade_date: str) -> Settings:
+    settings = Settings(cache_dir=cache_dir, data_backend="sqlite")
+    backend = SqliteBackend(settings.sqlite_path)
+    backend.init()
+    df = pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": trade_date,
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "vol": 100.0,
+                "amount": 1000.0,
+            }
+        ]
+    )
+    backend.upsert_daily_df(df)
+    backend.mark_trade_date_updated(trade_date)
     return settings
 
 
@@ -241,3 +265,103 @@ def test_auth_email_signup_flow(tmp_path: Path, monkeypatch) -> None:
 
     r6 = client.get("/v1/status", headers={"Authorization": f"Bearer {token}"})
     assert r6.status_code == 200
+
+
+def test_update_wait_skips_baostock_update_until_published(tmp_path: Path, monkeypatch) -> None:
+    settings = _seed_sqlite_one_day(tmp_path, "20240130")
+
+    import stock_screener.server as server
+
+    calls = {"update": 0}
+
+    def fake_update_daily_service(**_kwargs) -> None:
+        calls["update"] += 1
+
+    def fake_probe_baostock_daily_available(*, trade_date: str) -> tuple[bool, str]:
+        return False, f"not published: {trade_date}"
+
+    def fake_resolve_wait_target_trade_date(*, provider: str, target_date: str, lookback_days: int = 30) -> str:
+        return target_date
+
+    monkeypatch.setattr(server, "update_daily_service", fake_update_daily_service)
+    monkeypatch.setattr(server, "probe_baostock_daily_available", fake_probe_baostock_daily_available)
+    monkeypatch.setattr(server, "resolve_wait_target_trade_date", fake_resolve_wait_target_trade_date)
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.post(
+        "/v1/update/wait",
+        json={"provider": "baostock", "target_date": "20240131", "interval_seconds": 1, "timeout_seconds": 1},
+    )
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    time.sleep(0.2)
+    assert calls["update"] == 0
+
+    time.sleep(1.2)
+    r2 = client.get(f"/v1/update/wait/{job_id}")
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "timeout"
+    assert calls["update"] == 0
+
+
+def test_update_wait_baostock_succeeds_after_update(tmp_path: Path, monkeypatch) -> None:
+    settings = _seed_sqlite_one_day(tmp_path, "20240130")
+
+    import stock_screener.server as server
+
+    calls = {"update": 0}
+
+    def fake_update_daily_service(*, settings: Settings, start, end, provider, repair_days) -> None:
+        calls["update"] += 1
+        backend = SqliteBackend(settings.sqlite_path)
+        backend.init()
+        df = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": str(end),
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                }
+            ]
+        )
+        backend.upsert_daily_df(df)
+        backend.mark_trade_date_updated(str(end))
+
+    def fake_probe_baostock_daily_available(*, trade_date: str) -> tuple[bool, str]:
+        return True, f"published: {trade_date}"
+
+    def fake_resolve_wait_target_trade_date(*, provider: str, target_date: str, lookback_days: int = 30) -> str:
+        return target_date
+
+    monkeypatch.setattr(server, "update_daily_service", fake_update_daily_service)
+    monkeypatch.setattr(server, "probe_baostock_daily_available", fake_probe_baostock_daily_available)
+    monkeypatch.setattr(server, "resolve_wait_target_trade_date", fake_resolve_wait_target_trade_date)
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.post(
+        "/v1/update/wait",
+        json={"provider": "baostock", "target_date": "20240131", "interval_seconds": 1, "timeout_seconds": 5},
+    )
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    deadline = time.time() + 2.0
+    status = None
+    while time.time() < deadline:
+        status = client.get(f"/v1/update/wait/{job_id}").json()["status"]
+        if status != "running":
+            break
+        time.sleep(0.05)
+
+    assert status == "succeeded"
+    assert calls["update"] == 1

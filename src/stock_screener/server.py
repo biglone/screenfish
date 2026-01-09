@@ -46,11 +46,15 @@ from stock_screener.auth import (
 )
 from stock_screener.backends.sqlite_backend import SqliteBackend
 from stock_screener.config import Settings
-from stock_screener.dates import format_yyyymmdd, parse_yyyymmdd
+from stock_screener.dates import format_yyyymmdd, parse_yyyymmdd, subtract_calendar_days
 from stock_screener.formula_parser import execute_formula, execute_formula_outputs
 from stock_screener.pinyin import pinyin_full, pinyin_initials
+from stock_screener.providers import get_provider
+from stock_screener.providers.baostock_provider import BaoStockNotConfigured
+from stock_screener.providers.tushare_provider import TuShareTokenMissing
 from stock_screener.runner import run_screen
 from stock_screener.tdx import TdxEbkFormat, ts_code_to_ebk_code
+from stock_screener.tushare_client import TuShareNotConfigured
 from stock_screener.update import UpdateBadRequest, UpdateIncomplete, UpdateNotConfigured, update_daily_service
 
 
@@ -123,6 +127,66 @@ def _tail_journald_user_unit(unit: str, *, max_lines: int) -> list[str]:
     if res.returncode != 0:
         raise RuntimeError((res.stderr or "").strip() or "journalctl failed")
     return (res.stdout or "").splitlines()
+
+
+def resolve_wait_target_trade_date(
+    *,
+    provider: Literal["baostock", "tushare"],
+    target_date: str,
+    lookback_days: int = 30,
+) -> str:
+    parse_yyyymmdd(target_date)
+    if lookback_days < 0:
+        raise ValueError("lookback_days must be >= 0")
+    start = subtract_calendar_days(target_date, lookback_days)
+    try:
+        p = get_provider(provider)
+        open_dates = p.open_trade_dates(start=start, end=target_date)
+    except (TuShareNotConfigured, BaoStockNotConfigured, TuShareTokenMissing, ValueError) as e:
+        raise ValueError(str(e)) from e
+    except Exception as e:  # pragma: no cover
+        raise ValueError(str(e)) from e
+    if not open_dates:
+        raise ValueError(f"no open trade dates found for {provider} in {start}..{target_date}")
+    return str(open_dates[-1])
+
+
+def probe_baostock_daily_available(*, trade_date: str) -> tuple[bool, str]:
+    """
+    Lightweight probe to decide whether BaoStock has published daily bars for a trade date.
+
+    It avoids running a full-market update loop when the provider hasn't published yet.
+    """
+
+    parse_yyyymmdd(trade_date)
+    try:
+        import baostock as bs  # type: ignore
+    except ModuleNotFoundError:
+        return False, "baostock not installed"
+
+    lg = bs.login()
+    if getattr(lg, "error_code", "0") != "0":
+        return False, f"login failed: {getattr(lg, 'error_msg', '')}"
+
+    try:
+        iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+        samples = ["sh.600000", "sz.000001"]
+        for code in samples:
+            rs = bs.query_history_k_data_plus(
+                code,
+                "date,code,close",
+                start_date=iso,
+                end_date=iso,
+                frequency="d",
+                adjustflag="3",
+            )
+            if rs is None or getattr(rs, "error_code", "0") != "0":
+                continue
+            if rs.next():
+                return True, f"sample ok: {code}"
+        return False, "no sample rows yet"
+    finally:
+        bs.logout()
 
 
 def _watchlist_owner_id(x_api_key: str | None = Header(default=None)) -> str:
@@ -524,6 +588,21 @@ def create_app(*, settings: Settings) -> FastAPI:
         )
 
     def _run_update_wait_job(*, job_id: str, settings: Settings) -> None:
+        def _local_ready(trade_date: str) -> tuple[bool, str | None]:
+            backend = _backend(settings)
+            with backend.connect() as conn:
+                row = conn.execute("SELECT MAX(trade_date) AS d FROM daily").fetchone()
+                latest = row["d"] if row else None
+                has_rows = conn.execute(
+                    "SELECT 1 FROM daily WHERE trade_date = ? LIMIT 1",
+                    (trade_date,),
+                ).fetchone() is not None
+                marked = conn.execute(
+                    "SELECT 1 FROM update_log WHERE trade_date = ? LIMIT 1",
+                    (trade_date,),
+                ).fetchone() is not None
+            return bool(has_rows and marked), (str(latest) if latest is not None else None)
+
         while True:
             with update_wait_jobs_lock:
                 job = update_wait_jobs.get(job_id)
@@ -551,8 +630,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
             elapsed = time.time() - started_at
             if elapsed >= timeout_seconds:
-                backend = _backend(settings)
-                latest = backend.max_trade_date_in_daily()
+                _, latest = _local_ready(target)
                 with update_wait_jobs_lock:
                     job = update_wait_jobs.get(job_id)
                     if job is None or job.status != "running":
@@ -563,19 +641,53 @@ def create_app(*, settings: Settings) -> FastAPI:
                     job.finished_at = time.time()
                 return
 
+            ready, latest = _local_ready(target)
+            if ready:
+                with update_wait_jobs_lock:
+                    job = update_wait_jobs.get(job_id)
+                    if job is None:
+                        return
+                    job.status = "succeeded"
+                    job.latest_trade_date = latest
+                    job.message = "daily data available"
+                    job.finished_at = time.time()
+                return
+
             with update_wait_jobs_lock:
                 job = update_wait_jobs.get(job_id)
                 if job is None or job.status != "running":
                     return
                 job.attempts += 1
-                job.message = f"updating (attempt {job.attempts})"
+                job.latest_trade_date = latest
+                job.message = f"checking (attempt {job.attempts})"
                 job.last_error = None
+
+            if provider == "baostock":
+                ok_remote, detail = probe_baostock_daily_available(trade_date=target)
+                if not ok_remote:
+                    with update_wait_jobs_lock:
+                        job = update_wait_jobs.get(job_id)
+                        if job is None or job.status != "running":
+                            return
+                        job.latest_trade_date = latest
+                        job.message = f"waiting for provider publish ({detail})"
+                    remaining = timeout_seconds - (time.time() - started_at)
+                    sleep_for = max(0.0, min(float(interval_seconds), float(remaining)))
+                    if sleep_for <= 0:
+                        continue
+                    cancel_event.wait(sleep_for)
+                    continue
+
+            with update_wait_jobs_lock:
+                job = update_wait_jobs.get(job_id)
+                if job is None or job.status != "running":
+                    return
+                job.message = f"updating (attempt {job.attempts})"
 
             try:
                 update_daily_service(settings=settings, start=None, end=target, provider=provider, repair_days=repair_days)
             except (UpdateBadRequest, UpdateNotConfigured) as e:
-                backend = _backend(settings)
-                latest = backend.max_trade_date_in_daily()
+                _, latest = _local_ready(target)
                 with update_wait_jobs_lock:
                     job = update_wait_jobs.get(job_id)
                     if job is None:
@@ -600,10 +712,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                     job.last_error = str(e)
                     job.message = f"error: {e}; retrying"
 
-            backend = _backend(settings)
-            latest = backend.max_trade_date_in_daily()
-            available = latest == target and backend.count_daily_rows_for_trade_date(target) > 0
-            if available:
+            ready, latest = _local_ready(target)
+            if ready:
                 with update_wait_jobs_lock:
                     job = update_wait_jobs.get(job_id)
                     if job is None:
@@ -1036,9 +1146,14 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     @app.post("/v1/update/wait", response_model=UpdateWaitResponse, dependencies=[Depends(_admin_required)])
     def start_update_wait(req: UpdateWaitRequest, settings: Settings = Depends(_settings_dep)) -> UpdateWaitResponse:
-        target = req.target_date or format_yyyymmdd(_date.today())
+        requested = req.target_date or format_yyyymmdd(_date.today())
         try:
-            parse_yyyymmdd(target)
+            parse_yyyymmdd(requested)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        try:
+            target = resolve_wait_target_trade_date(provider=req.provider, target_date=requested)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -1061,6 +1176,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                 timeout_seconds=req.timeout_seconds,
                 started_at=time.time(),
             )
+            if target != requested:
+                job.message = f"target_date adjusted: {requested} -> {target}"
             update_wait_jobs[job_id] = job
 
         t = threading.Thread(target=_run_update_wait_job, kwargs={"job_id": job_id, "settings": settings}, daemon=True)

@@ -100,11 +100,12 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
                 typer.echo(f"updating {d} ...")
                 df = p.daily_by_trade_date(trade_date=d)
                 if df.empty:
-                    typer.echo(f"warning: empty daily for {d}", err=True)
-                    backend.mark_trade_date_updated_in_conn(conn, d)
-                    continue
+                    raise UpdateIncomplete(
+                        f"empty daily for {d}; provider may not have published data yet, please rerun later"
+                    )
                 backend.upsert_daily_df_in_conn(conn, df)
                 backend.mark_trade_date_updated_in_conn(conn, d)
+                conn.commit()
         typer.echo("done")
         return
 
