@@ -1409,7 +1409,22 @@ def create_app(*, settings: Settings) -> FastAPI:
             name = name_row["name"] if name_row else None
 
             # Build query for daily bars
-            query = "SELECT trade_date, open, high, low, close, vol, amount FROM daily WHERE ts_code = ?"
+            query = """
+            SELECT
+                trade_date,
+                open,
+                high,
+                low,
+                close,
+                COALESCE(vol, 0) as vol,
+                COALESCE(amount, 0) as amount
+            FROM daily
+            WHERE ts_code = ?
+              AND open IS NOT NULL
+              AND high IS NOT NULL
+              AND low IS NOT NULL
+              AND close IS NOT NULL
+            """
             params: list[Any] = [ts_code]
             if start:
                 query += " AND trade_date >= ?"
@@ -1915,7 +1930,22 @@ def create_app(*, settings: Settings) -> FastAPI:
             raise HTTPException(status_code=400, detail=f"Invalid indicator timeframe: {timeframe}")
 
         with backend.connect() as conn:
-            query = "SELECT trade_date, open, high, low, close, vol, amount FROM daily WHERE ts_code = ?"
+            query = """
+            SELECT
+                trade_date,
+                open,
+                high,
+                low,
+                close,
+                COALESCE(vol, 0) as vol,
+                COALESCE(amount, 0) as amount
+            FROM daily
+            WHERE ts_code = ?
+              AND open IS NOT NULL
+              AND high IS NOT NULL
+              AND low IS NOT NULL
+              AND close IS NOT NULL
+            """
             params: list[Any] = [ts_code]
             if start:
                 query += " AND trade_date >= ?"
