@@ -33,3 +33,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:launch_testing -p no:launch_ros"

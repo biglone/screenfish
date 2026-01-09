@@ -175,6 +175,8 @@ API 文档（OpenAPI）：
 - `GET /v1/status`：查看本地缓存状态与最新交易日
 - `GET /v1/data/availability?provider=baostock&date=YYYYMMDD`：探测当日日线是否已可取
 - `POST /v1/update`：触发更新（支持 `start/end` 或自动模式）
-- `POST /v1/update/wait`：轮询更新直到目标日期数据可用或超时
+- `POST /v1/update/wait`：创建“等待更新”任务并返回 `job_id`（后台轮询直到数据可用/超时）
+- `GET /v1/update/wait/{job_id}`：查询任务状态（`running/succeeded/failed/timeout/canceled`）
+- `DELETE /v1/update/wait/{job_id}`：取消任务（best-effort）
 - `POST /v1/screen`：对指定日期/最新日期执行筛选
 - `POST /v1/export/ebk`：导出筛选命中的 `.EBK` 内容（可用于通达信导入）

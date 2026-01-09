@@ -42,8 +42,12 @@ class SqliteBackend:
                 CREATE TABLE IF NOT EXISTS stock_basic (
                   ts_code TEXT PRIMARY KEY,
                   name TEXT,
+                  pinyin_initials TEXT,
+                  pinyin_full TEXT,
                   updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_stock_basic_pinyin_initials ON stock_basic (pinyin_initials);
+                CREATE INDEX IF NOT EXISTS idx_stock_basic_pinyin_full ON stock_basic (pinyin_full);
 
                 CREATE TABLE IF NOT EXISTS provider_stock_progress (
                   provider TEXT NOT NULL,
@@ -88,6 +92,33 @@ class SqliteBackend:
                 );
                 CREATE INDEX IF NOT EXISTS idx_watchlist_items_owner_group_updated_at
                   ON watchlist_items (owner_id, group_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS users (
+                  id TEXT PRIMARY KEY,
+                  username TEXT NOT NULL UNIQUE,
+                  email TEXT,
+                  password_hash TEXT NOT NULL,
+                  password_salt TEXT NOT NULL,
+                  role TEXT NOT NULL DEFAULT 'user',
+                  disabled INTEGER NOT NULL DEFAULT 0,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
+
+                CREATE TABLE IF NOT EXISTS email_verification_codes (
+                  email TEXT PRIMARY KEY,
+                  code_hash TEXT NOT NULL,
+                  code_salt TEXT NOT NULL,
+                  expires_at INTEGER NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  send_count INTEGER NOT NULL DEFAULT 0,
+                  last_sent_at INTEGER NOT NULL DEFAULT 0,
+                  attempts INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_email_verification_codes_expires_at
+                  ON email_verification_codes (expires_at);
                 """
             )
             self._migrate(conn)
@@ -104,6 +135,72 @@ class SqliteBackend:
             conn.execute("ALTER TABLE formulas ADD COLUMN kind TEXT NOT NULL DEFAULT 'screen'")
         if not _has_column("formulas", "timeframe"):
             conn.execute("ALTER TABLE formulas ADD COLUMN timeframe TEXT")
+
+        # Users: add email column and unique index.
+        if _has_column("users", "id") and not _has_column("users", "email"):
+            conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        if _has_column("users", "email"):
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
+                  ON users (email)
+                  WHERE email IS NOT NULL
+                """
+            )
+
+        # stock_basic: add pinyin cache columns for fast search.
+        if _has_column("stock_basic", "ts_code") and not _has_column("stock_basic", "pinyin_initials"):
+            conn.execute("ALTER TABLE stock_basic ADD COLUMN pinyin_initials TEXT")
+        if _has_column("stock_basic", "ts_code") and not _has_column("stock_basic", "pinyin_full"):
+            conn.execute("ALTER TABLE stock_basic ADD COLUMN pinyin_full TEXT")
+        if _has_column("stock_basic", "pinyin_initials"):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stock_basic_pinyin_initials ON stock_basic (pinyin_initials)"
+            )
+        if _has_column("stock_basic", "pinyin_full"):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stock_basic_pinyin_full ON stock_basic (pinyin_full)"
+            )
+
+        try:
+            from stock_screener.pinyin import pinyin_full as _pinyin_full
+            from stock_screener.pinyin import pinyin_initials as _pinyin_initials
+        except Exception:
+            return
+
+        if _pinyin_initials("平安银行") is None or _pinyin_full("平安银行") is None:
+            return
+
+        try:
+            rows = conn.execute(
+                """
+                SELECT ts_code, name
+                FROM stock_basic
+                WHERE name IS NOT NULL
+                  AND (pinyin_initials IS NULL OR pinyin_full IS NULL)
+                """,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+
+        updates: list[tuple[str | None, str | None, str]] = []
+        for row in rows:
+            name = row["name"]
+            if name is None:
+                continue
+            name_str = str(name)
+            updates.append(
+                (
+                    _pinyin_initials(name_str),
+                    _pinyin_full(name_str),
+                    str(row["ts_code"]),
+                )
+            )
+        if updates:
+            conn.executemany(
+                "UPDATE stock_basic SET pinyin_initials = ?, pinyin_full = ? WHERE ts_code = ?",
+                updates,
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -223,14 +320,35 @@ class SqliteBackend:
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"missing columns in stock_basic df: {missing}")
+        try:
+            from stock_screener.pinyin import pinyin_full as _pinyin_full
+            from stock_screener.pinyin import pinyin_initials as _pinyin_initials
+        except Exception:
+            _pinyin_full = None  # type: ignore[assignment]
+            _pinyin_initials = None  # type: ignore[assignment]
+
         now = datetime.now(timezone.utc).isoformat()
         tmp = df[required].copy()
         tmp["ts_code"] = tmp["ts_code"].astype(str)
         tmp["name"] = tmp["name"].astype(object).where(tmp["name"].notna(), None)
+        if _pinyin_initials is None or _pinyin_full is None:
+            tmp["pinyin_initials"] = None
+            tmp["pinyin_full"] = None
+        else:
+            tmp["pinyin_initials"] = tmp["name"].apply(lambda x: _pinyin_initials(str(x)) if x else None)
+            tmp["pinyin_full"] = tmp["name"].apply(lambda x: _pinyin_full(str(x)) if x else None)
         tmp["updated_at"] = now
-        rows = tmp[["ts_code", "name", "updated_at"]].itertuples(index=False, name=None)
+        rows = tmp[["ts_code", "name", "pinyin_initials", "pinyin_full", "updated_at"]].itertuples(index=False, name=None)
         conn.executemany(
-            "INSERT OR REPLACE INTO stock_basic (ts_code, name, updated_at) VALUES (?, ?, ?)",
+            """
+            INSERT INTO stock_basic (ts_code, name, pinyin_initials, pinyin_full, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(ts_code) DO UPDATE SET
+              name = COALESCE(excluded.name, stock_basic.name),
+              pinyin_initials = COALESCE(excluded.pinyin_initials, stock_basic.pinyin_initials),
+              pinyin_full = COALESCE(excluded.pinyin_full, stock_basic.pinyin_full),
+              updated_at = excluded.updated_at
+            """,
             rows,
         )
 

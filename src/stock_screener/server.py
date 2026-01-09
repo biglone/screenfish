@@ -3,13 +3,16 @@ from __future__ import annotations
 import math
 import os
 import re
+import secrets
 import shutil
+import sqlite3
 import subprocess
+import threading
 import time
 import uuid
 from hashlib import sha256
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date as _date
 from pathlib import Path
 from typing import Any, Literal
@@ -21,6 +24,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
+from stock_screener.auth import (
+    AuthUser,
+    auth_enabled,
+    auth_allowed_email_domains,
+    auth_email_code_cooldown_seconds,
+    auth_email_code_max_attempts,
+    auth_email_code_ttl_seconds,
+    auth_email_debug_return_code,
+    auth_secret,
+    auth_signup_mode,
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    normalize_username,
+    send_email,
+    smtp_config,
+    token_ttl_seconds,
+    validate_email,
+    verify_password,
+)
 from stock_screener.backends.sqlite_backend import SqliteBackend
 from stock_screener.config import Settings
 from stock_screener.dates import format_yyyymmdd, parse_yyyymmdd
@@ -35,7 +58,7 @@ def _api_key_required(x_api_key: str | None = Header(default=None)) -> None:
     required = os.environ.get("STOCK_SCREENER_API_KEY")
     if not required:
         return
-    if not x_api_key or x_api_key != required:
+    if not x_api_key or not secrets.compare_digest(x_api_key, required):
         raise HTTPException(status_code=401, detail="missing/invalid X-API-Key")
 
 
@@ -45,7 +68,7 @@ def _admin_token_required(x_admin_token: str | None = Header(default=None)) -> N
     token = os.environ.get("STOCK_SCREENER_ADMIN_TOKEN", "").strip()
     if not enabled or not token:
         raise HTTPException(status_code=404, detail="Not Found")
-    if not x_admin_token or x_admin_token != token:
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, token):
         raise HTTPException(status_code=401, detail="missing/invalid X-Admin-Token")
 
 
@@ -105,7 +128,7 @@ def _tail_journald_user_unit(unit: str, *, max_lines: int) -> list[str]:
 def _watchlist_owner_id(x_api_key: str | None = Header(default=None)) -> str:
     required = os.environ.get("STOCK_SCREENER_API_KEY")
     if required:
-        if not x_api_key or x_api_key != required:
+        if not x_api_key or not secrets.compare_digest(x_api_key, required):
             raise HTTPException(status_code=401, detail="missing/invalid X-API-Key")
         return sha256(x_api_key.encode("utf-8")).hexdigest()
     return "public"
@@ -137,13 +160,20 @@ class UpdateWaitRequest(BaseModel):
     timeout_seconds: int = Field(default=7200, ge=1)
 
 
+UpdateWaitJobStatus = Literal["running", "succeeded", "failed", "timeout", "canceled"]
+
+
 class UpdateWaitResponse(BaseModel):
+    job_id: str
+    status: UpdateWaitJobStatus
     ok: bool
+    provider: Literal["baostock", "tushare"]
     target_date: str
     latest_trade_date: str | None
     attempts: int
     elapsed_seconds: float
     message: str
+    last_error: str | None = None
 
 
 class ScreenRequest(BaseModel):
@@ -236,6 +266,45 @@ class LogTailResponse(BaseModel):
     lines: list[str] = Field(default_factory=list)
 
 
+class AuthRegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class AuthLoginRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class AuthUserResponse(BaseModel):
+    id: str
+    username: str
+    role: Literal["admin", "user"]
+
+
+class AuthTokenResponse(BaseModel):
+    token: str
+    expires_at: int
+    user: AuthUserResponse
+
+
+class AuthEmailCodeRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+
+
+class AuthEmailCodeResponse(BaseModel):
+    ok: bool = True
+    expires_at: int
+    debug_code: str | None = None
+
+
+class AuthEmailRegisterRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    code: str = Field(..., min_length=4, max_length=12)
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=128)
+
+
 class FormulaItem(BaseModel):
     id: int
     name: str
@@ -302,12 +371,33 @@ class IndicatorSeriesResponse(BaseModel):
 @dataclass(frozen=True)
 class AppState:
     settings: Settings
+    auth_enabled: bool
+    auth_secret: bytes | None
+    auth_token_ttl_seconds: int
+    auth_signup_mode: Literal["open", "email", "closed"]
+
+
+@dataclass
+class _UpdateWaitJob:
+    job_id: str
+    provider: Literal["baostock", "tushare"]
+    target_date: str
+    repair_days: int
+    interval_seconds: int
+    timeout_seconds: int
+    started_at: float
+
+    status: UpdateWaitJobStatus = "running"
+    attempts: int = 0
+    latest_trade_date: str | None = None
+    message: str = "job started"
+    last_error: str | None = None
+    finished_at: float | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 def _backend(settings: Settings) -> SqliteBackend:
-    backend = SqliteBackend(settings.sqlite_path)
-    backend.init()
-    return backend
+    return SqliteBackend(settings.sqlite_path)
 
 
 class _StripPrefixMiddleware:
@@ -331,17 +421,15 @@ class _StripPrefixMiddleware:
 def create_app(*, settings: Settings) -> FastAPI:
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
+        backend = SqliteBackend(settings.sqlite_path)
+        backend.init()
+
         prewarm_pinyin_env = os.environ.get("STOCK_SCREENER_PREWARM_PINYIN", "1").strip().lower()
         prewarm_pinyin = prewarm_pinyin_env in {"1", "true", "yes", "y", "on"}
         if prewarm_pinyin:
             # Warm up pinyin cache to avoid the first pinyin search request paying the full cost.
-            import sqlite3 as _sqlite3
-
             try:
-                SqliteBackend(settings.sqlite_path).init()
-                conn = _sqlite3.connect(str(settings.sqlite_path))
-                try:
-                    conn.row_factory = _sqlite3.Row
+                with backend.connect() as conn:
                     cur = conn.cursor()
                     cur.execute("SELECT name FROM stock_basic WHERE name IS NOT NULL")
                     for row in cur.fetchall():
@@ -353,16 +441,29 @@ def create_app(*, settings: Settings) -> FastAPI:
                             _ = pinyin_full(str(name))
                         except Exception:
                             continue
-                finally:
-                    conn.close()
             except Exception:
                 # Best-effort only; ignore warmup failures.
                 pass
 
         yield
 
+    enabled_auth = auth_enabled()
+    secret: bytes | None = None
+    ttl_seconds = 0
+    signup_mode: Literal["open", "email", "closed"] = "open"
+    if enabled_auth:
+        secret = auth_secret()
+        ttl_seconds = token_ttl_seconds()
+        signup_mode = auth_signup_mode()
+
     app = FastAPI(title="stock_screener", version="0.1.0", lifespan=_lifespan)
-    state = AppState(settings=settings)
+    state = AppState(
+        settings=settings,
+        auth_enabled=enabled_auth,
+        auth_secret=secret,
+        auth_token_ttl_seconds=ttl_seconds,
+        auth_signup_mode=signup_mode,
+    )
     app.state.app_state = state
 
     # Allow the UI to call same-origin APIs under `/api/*` without requiring a reverse proxy rewrite.
@@ -385,9 +486,494 @@ def create_app(*, settings: Settings) -> FastAPI:
     def _settings_dep() -> Settings:
         return app.state.app_state.settings
 
-    @app.get("/v1/health", dependencies=[Depends(_api_key_required)])
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    update_wait_jobs: dict[str, _UpdateWaitJob] = {}
+    update_wait_jobs_lock = threading.Lock()
+
+    def _cleanup_update_wait_jobs(*, max_jobs: int = 200, max_age_seconds: int = 24 * 60 * 60) -> None:
+        now = time.time()
+        with update_wait_jobs_lock:
+            stale = [
+                job_id
+                for job_id, job in update_wait_jobs.items()
+                if job.finished_at is not None and now - job.finished_at > max_age_seconds
+            ]
+            for job_id in stale:
+                update_wait_jobs.pop(job_id, None)
+            if len(update_wait_jobs) <= max_jobs:
+                return
+            finished = [j for j in update_wait_jobs.values() if j.finished_at is not None]
+            finished.sort(key=lambda j: j.finished_at or 0.0)
+            for j in finished[: max(0, len(update_wait_jobs) - max_jobs)]:
+                update_wait_jobs.pop(j.job_id, None)
+
+    def _update_wait_job_response(job: _UpdateWaitJob) -> UpdateWaitResponse:
+        now = time.time()
+        elapsed = (job.finished_at or now) - job.started_at
+        ok = job.status == "succeeded"
+        return UpdateWaitResponse(
+            job_id=job.job_id,
+            status=job.status,
+            ok=ok,
+            provider=job.provider,
+            target_date=job.target_date,
+            latest_trade_date=job.latest_trade_date,
+            attempts=job.attempts,
+            elapsed_seconds=elapsed,
+            message=job.message,
+            last_error=job.last_error,
+        )
+
+    def _run_update_wait_job(*, job_id: str, settings: Settings) -> None:
+        while True:
+            with update_wait_jobs_lock:
+                job = update_wait_jobs.get(job_id)
+                if job is None:
+                    return
+                if job.status != "running":
+                    return
+                cancel_event = job.cancel_event
+                target = job.target_date
+                provider = job.provider
+                repair_days = job.repair_days
+                interval_seconds = job.interval_seconds
+                timeout_seconds = job.timeout_seconds
+                started_at = job.started_at
+
+            if cancel_event.is_set():
+                with update_wait_jobs_lock:
+                    job = update_wait_jobs.get(job_id)
+                    if job is None or job.status != "running":
+                        return
+                    job.status = "canceled"
+                    job.message = "canceled"
+                    job.finished_at = time.time()
+                return
+
+            elapsed = time.time() - started_at
+            if elapsed >= timeout_seconds:
+                backend = _backend(settings)
+                latest = backend.max_trade_date_in_daily()
+                with update_wait_jobs_lock:
+                    job = update_wait_jobs.get(job_id)
+                    if job is None or job.status != "running":
+                        return
+                    job.status = "timeout"
+                    job.latest_trade_date = latest
+                    job.message = "timeout waiting for daily data"
+                    job.finished_at = time.time()
+                return
+
+            with update_wait_jobs_lock:
+                job = update_wait_jobs.get(job_id)
+                if job is None or job.status != "running":
+                    return
+                job.attempts += 1
+                job.message = f"updating (attempt {job.attempts})"
+                job.last_error = None
+
+            try:
+                update_daily_service(settings=settings, start=None, end=target, provider=provider, repair_days=repair_days)
+            except (UpdateBadRequest, UpdateNotConfigured) as e:
+                backend = _backend(settings)
+                latest = backend.max_trade_date_in_daily()
+                with update_wait_jobs_lock:
+                    job = update_wait_jobs.get(job_id)
+                    if job is None:
+                        return
+                    job.status = "failed"
+                    job.latest_trade_date = latest
+                    job.last_error = str(e)
+                    job.message = str(e)
+                    job.finished_at = time.time()
+                return
+            except UpdateIncomplete as e:
+                with update_wait_jobs_lock:
+                    job = update_wait_jobs.get(job_id)
+                    if job is None or job.status != "running":
+                        return
+                    job.message = str(e) or "update incomplete; retrying"
+            except Exception as e:
+                with update_wait_jobs_lock:
+                    job = update_wait_jobs.get(job_id)
+                    if job is None or job.status != "running":
+                        return
+                    job.last_error = str(e)
+                    job.message = f"error: {e}; retrying"
+
+            backend = _backend(settings)
+            latest = backend.max_trade_date_in_daily()
+            available = latest == target and backend.count_daily_rows_for_trade_date(target) > 0
+            if available:
+                with update_wait_jobs_lock:
+                    job = update_wait_jobs.get(job_id)
+                    if job is None:
+                        return
+                    job.status = "succeeded"
+                    job.latest_trade_date = latest
+                    job.message = "daily data available"
+                    job.finished_at = time.time()
+                return
+
+            with update_wait_jobs_lock:
+                job = update_wait_jobs.get(job_id)
+                if job is None or job.status != "running":
+                    return
+                job.latest_trade_date = latest
+                job.message = "waiting for daily data"
+
+            remaining = timeout_seconds - (time.time() - started_at)
+            sleep_for = max(0.0, min(float(interval_seconds), float(remaining)))
+            if sleep_for <= 0:
+                continue
+            cancel_event.wait(sleep_for)
+
+    def _auth_enabled_required() -> None:
+        if not app.state.app_state.auth_enabled:
+            raise HTTPException(status_code=404, detail="Not Found")
+
+    def _api_key_required_if_auth_disabled(x_api_key: str | None = Header(default=None)) -> None:
+        if app.state.app_state.auth_enabled:
+            return
+        _api_key_required(x_api_key)
+
+    def _bearer_token(authorization: str | None) -> str:
+        raw = (authorization or "").strip()
+        if not raw:
+            raise HTTPException(status_code=401, detail="missing/invalid Authorization")
+        m = re.match(r"^Bearer\s+(.+)$", raw, flags=re.IGNORECASE)
+        if not m:
+            raise HTTPException(status_code=401, detail="missing/invalid Authorization")
+        token = m.group(1).strip()
+        if not token:
+            raise HTTPException(status_code=401, detail="missing/invalid Authorization")
+        return token
+
+    def _user_from_bearer_token(authorization: str | None, *, settings: Settings) -> AuthUser:
+        secret = app.state.app_state.auth_secret
+        if secret is None:
+            raise HTTPException(status_code=500, detail="auth misconfigured")
+        token = _bearer_token(authorization)
+        try:
+            claims = decode_access_token(token, secret=secret)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="invalid token")
+        user_id = str(claims.get("uid") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="invalid token")
+
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT id, username, role, disabled FROM users WHERE id = ? LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        if not row or int(row["disabled"] or 0) != 0:
+            raise HTTPException(status_code=401, detail="invalid token")
+        role = str(row["role"] or "user")
+        if role not in {"admin", "user"}:
+            raise HTTPException(status_code=401, detail="invalid token")
+        return AuthUser(id=str(row["id"]), username=str(row["username"]), role=role)  # type: ignore[arg-type]
+
+    def _access_required(
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        settings: Settings = Depends(_settings_dep),
+    ) -> AuthUser | None:
+        if app.state.app_state.auth_enabled:
+            return _user_from_bearer_token(authorization, settings=settings)
+        _api_key_required(x_api_key)
+        return None
+
+    def _admin_required(user: AuthUser | None = Depends(_access_required)) -> AuthUser | None:
+        if app.state.app_state.auth_enabled and user is not None and user.role != "admin":
+            raise HTTPException(status_code=403, detail="admin required")
+        return user
+
+    def _watchlist_owner_id(
+        user: AuthUser | None = Depends(_access_required),
+        x_api_key: str | None = Header(default=None),
+    ) -> str:
+        if user is not None:
+            return user.id
+        required = os.environ.get("STOCK_SCREENER_API_KEY")
+        if required:
+            key = (x_api_key or "").strip() or required
+            return sha256(key.encode("utf-8")).hexdigest()
+        return "public"
+
+    @app.get("/v1/health", dependencies=[Depends(_api_key_required_if_auth_disabled)])
+    def health(settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
+        bootstrap = False
+        if app.state.app_state.auth_enabled:
+            backend = _backend(settings)
+            with backend.connect() as conn:
+                bootstrap = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None
+
+        return {
+            "status": "ok",
+            "auth_enabled": app.state.app_state.auth_enabled,
+            "auth_signup_mode": app.state.app_state.auth_signup_mode if app.state.app_state.auth_enabled else None,
+            "auth_bootstrap": bootstrap if app.state.app_state.auth_enabled else None,
+        }
+
+    @app.post("/v1/auth/register", response_model=AuthTokenResponse, dependencies=[Depends(_auth_enabled_required)])
+    def register(req: AuthRegisterRequest, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
+        username = normalize_username(req.username)
+        if len(username) < 3:
+            raise HTTPException(status_code=400, detail="username too short")
+        if len(req.password) < 8:
+            raise HTTPException(status_code=400, detail="password too short")
+
+        backend = _backend(settings)
+        now = int(time.time())
+        user_id = uuid.uuid4().hex
+        password_hash, password_salt = hash_password(req.password)
+        with backend.connect() as conn:
+            any_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+            if any_user and app.state.app_state.auth_signup_mode != "open":
+                raise HTTPException(status_code=404, detail="Not Found")
+            exists = conn.execute("SELECT 1 FROM users WHERE username = ? LIMIT 1", (username,)).fetchone()
+            if exists:
+                raise HTTPException(status_code=409, detail="username already exists")
+            role = "admin" if not any_user else "user"
+            conn.execute(
+                """
+                INSERT INTO users (id, username, password_hash, password_salt, role, disabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (user_id, username, password_hash, password_salt, role, now, now),
+            )
+
+        secret = app.state.app_state.auth_secret
+        if secret is None:
+            raise HTTPException(status_code=500, detail="auth misconfigured")
+        expires_at = now + int(app.state.app_state.auth_token_ttl_seconds)
+        token = create_access_token({"uid": user_id}, secret=secret, expires_at=expires_at)
+        return AuthTokenResponse(
+            token=token,
+            expires_at=expires_at,
+            user=AuthUserResponse(id=user_id, username=username, role=role),  # type: ignore[arg-type]
+        )
+
+    @app.post(
+        "/v1/auth/email/request",
+        response_model=AuthEmailCodeResponse,
+        dependencies=[Depends(_auth_enabled_required)],
+    )
+    def request_email_code(req: AuthEmailCodeRequest, settings: Settings = Depends(_settings_dep)) -> AuthEmailCodeResponse:
+        if app.state.app_state.auth_signup_mode != "email":
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        try:
+            email = validate_email(req.email)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid email")
+
+        allowed_domains = auth_allowed_email_domains()
+        if allowed_domains:
+            domain = email.split("@", 1)[1]
+            if domain not in allowed_domains:
+                raise HTTPException(status_code=403, detail="email domain not allowed")
+
+        now = int(time.time())
+        ttl_seconds = auth_email_code_ttl_seconds()
+        cooldown_seconds = auth_email_code_cooldown_seconds()
+        expires_at = now + ttl_seconds
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        code_hash, code_salt = hash_password(code)
+
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            if conn.execute("SELECT 1 FROM users WHERE email = ? LIMIT 1", (email,)).fetchone():
+                raise HTTPException(status_code=409, detail="email already registered")
+
+            row = conn.execute(
+                "SELECT last_sent_at FROM email_verification_codes WHERE email = ? LIMIT 1",
+                (email,),
+            ).fetchone()
+            if row and cooldown_seconds > 0:
+                last_sent_at = int(row["last_sent_at"] or 0)
+                wait = cooldown_seconds - (now - last_sent_at)
+                if wait > 0:
+                    raise HTTPException(status_code=429, detail=f"too many requests; retry in {wait}s")
+
+            conn.execute(
+                """
+                INSERT INTO email_verification_codes
+                  (email, code_hash, code_salt, expires_at, created_at, updated_at, send_count, last_sent_at, attempts)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0)
+                ON CONFLICT(email) DO UPDATE SET
+                  code_hash = excluded.code_hash,
+                  code_salt = excluded.code_salt,
+                  expires_at = excluded.expires_at,
+                  updated_at = excluded.updated_at,
+                  send_count = send_count + 1,
+                  last_sent_at = excluded.last_sent_at,
+                  attempts = 0
+                """,
+                (email, code_hash, code_salt, expires_at, now, now, now),
+            )
+
+        debug = auth_email_debug_return_code()
+        if debug:
+            return AuthEmailCodeResponse(expires_at=expires_at, debug_code=code)
+
+        cfg = smtp_config()
+        if cfg is None:
+            raise HTTPException(status_code=500, detail="smtp not configured")
+        try:
+            send_email(
+                config=cfg,
+                to_addr=email,
+                subject="ScreenFish 注册验证码",
+                body=f"你的 ScreenFish 注册验证码是：{code}\n\n有效期：{ttl_seconds} 秒\n",
+            )
+        except Exception:
+            raise HTTPException(status_code=500, detail="failed to send email")
+        return AuthEmailCodeResponse(expires_at=expires_at, debug_code=None)
+
+    @app.post(
+        "/v1/auth/register/email",
+        response_model=AuthTokenResponse,
+        dependencies=[Depends(_auth_enabled_required)],
+    )
+    def register_email(req: AuthEmailRegisterRequest, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
+        if app.state.app_state.auth_signup_mode != "email":
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        try:
+            email = validate_email(req.email)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid email")
+
+        allowed_domains = auth_allowed_email_domains()
+        if allowed_domains:
+            domain = email.split("@", 1)[1]
+            if domain not in allowed_domains:
+                raise HTTPException(status_code=403, detail="email domain not allowed")
+
+        code = re.sub(r"\s+", "", (req.code or "").strip())
+        if re.fullmatch(r"\d{6}", code) is None:
+            raise HTTPException(status_code=400, detail="invalid code")
+
+        username = normalize_username(req.username)
+        if len(username) < 3:
+            raise HTTPException(status_code=400, detail="username too short")
+        if len(req.password) < 8:
+            raise HTTPException(status_code=400, detail="password too short")
+
+        backend = _backend(settings)
+        now = int(time.time())
+        user_id = uuid.uuid4().hex
+        password_hash, password_salt = hash_password(req.password)
+        max_attempts = auth_email_code_max_attempts()
+
+        with backend.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT code_hash, code_salt, expires_at, attempts
+                FROM email_verification_codes
+                WHERE email = ?
+                LIMIT 1
+                """,
+                (email,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=400, detail="invalid code")
+
+            attempts = int(row["attempts"] or 0)
+            if attempts >= max_attempts:
+                raise HTTPException(status_code=429, detail="too many attempts")
+
+            expires_at = int(row["expires_at"] or 0)
+            if expires_at <= 0 or now >= expires_at:
+                conn.execute("DELETE FROM email_verification_codes WHERE email = ?", (email,))
+                raise HTTPException(status_code=400, detail="code expired")
+
+            if not verify_password(code, str(row["code_hash"]), str(row["code_salt"])):
+                conn.execute(
+                    "UPDATE email_verification_codes SET attempts = attempts + 1, updated_at = ? WHERE email = ?",
+                    (now, email),
+                )
+                raise HTTPException(status_code=400, detail="invalid code")
+
+            conn.execute("DELETE FROM email_verification_codes WHERE email = ?", (email,))
+
+            if conn.execute("SELECT 1 FROM users WHERE username = ? LIMIT 1", (username,)).fetchone():
+                raise HTTPException(status_code=409, detail="username already exists")
+            if conn.execute("SELECT 1 FROM users WHERE email = ? LIMIT 1", (email,)).fetchone():
+                raise HTTPException(status_code=409, detail="email already registered")
+
+            any_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+            role = "admin" if not any_user else "user"
+            conn.execute(
+                """
+                INSERT INTO users (id, username, email, password_hash, password_salt, role, disabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (user_id, username, email, password_hash, password_salt, role, now, now),
+            )
+
+        secret = app.state.app_state.auth_secret
+        if secret is None:
+            raise HTTPException(status_code=500, detail="auth misconfigured")
+        expires_at = now + int(app.state.app_state.auth_token_ttl_seconds)
+        token = create_access_token({"uid": user_id}, secret=secret, expires_at=expires_at)
+        return AuthTokenResponse(
+            token=token,
+            expires_at=expires_at,
+            user=AuthUserResponse(id=user_id, username=username, role=role),  # type: ignore[arg-type]
+        )
+
+    @app.post("/v1/auth/login", response_model=AuthTokenResponse, dependencies=[Depends(_auth_enabled_required)])
+    def login(req: AuthLoginRequest, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
+        ident_raw = (req.username or "").strip()
+        is_email = "@" in ident_raw
+        if is_email:
+            try:
+                identifier = validate_email(ident_raw)
+            except ValueError:
+                raise HTTPException(status_code=401, detail="invalid username or password")
+            where = "email = ?"
+        else:
+            identifier = normalize_username(ident_raw)
+            where = "username = ?"
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT id, username, role, password_hash, password_salt, disabled
+                FROM users
+                WHERE {where}
+                LIMIT 1
+                """,
+                (identifier,),
+            ).fetchone()
+        if not row or int(row["disabled"] or 0) != 0:
+            raise HTTPException(status_code=401, detail="invalid username or password")
+        if not verify_password(req.password, str(row["password_hash"]), str(row["password_salt"])):
+            raise HTTPException(status_code=401, detail="invalid username or password")
+
+        role = str(row["role"] or "user")
+        if role not in {"admin", "user"}:
+            raise HTTPException(status_code=401, detail="invalid username or password")
+        user_id = str(row["id"])
+
+        secret = app.state.app_state.auth_secret
+        if secret is None:
+            raise HTTPException(status_code=500, detail="auth misconfigured")
+        now = int(time.time())
+        expires_at = now + int(app.state.app_state.auth_token_ttl_seconds)
+        token = create_access_token({"uid": user_id}, secret=secret, expires_at=expires_at)
+        return AuthTokenResponse(
+            token=token,
+            expires_at=expires_at,
+            user=AuthUserResponse(id=user_id, username=str(row["username"]), role=role),  # type: ignore[arg-type]
+        )
+
+    @app.get("/v1/auth/me", response_model=AuthUserResponse, dependencies=[Depends(_auth_enabled_required)])
+    def me(user: AuthUser = Depends(_access_required)) -> AuthUserResponse:
+        return AuthUserResponse(id=user.id, username=user.username, role=user.role)
 
     @app.get(
         "/v1/admin/logs/backend",
@@ -409,23 +995,18 @@ def create_app(*, settings: Settings) -> FastAPI:
             return LogTailResponse(source="none", unit=unit, lines=[])
         return LogTailResponse(source="journald", unit=unit, lines=out[-lines:])
 
-    @app.get("/v1/status", response_model=StatusResponse, dependencies=[Depends(_api_key_required)])
+    @app.get("/v1/status", response_model=StatusResponse, dependencies=[Depends(_access_required)])
     def status(settings: Settings = Depends(_settings_dep)) -> StatusResponse:
         backend = _backend(settings)
-        max_daily = backend.max_trade_date_in_daily()
-        max_log = backend.max_trade_date_in_update_log()
-        # Query counts directly to avoid loading data
-        import sqlite3
-
-        conn = sqlite3.connect(str(settings.sqlite_path))
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM daily")
-            total_rows = int(cur.fetchone()[0])
-            cur.execute("SELECT COUNT(DISTINCT ts_code) FROM daily")
-            total_stocks = int(cur.fetchone()[0])
-        finally:
-            conn.close()
+        with backend.connect() as conn:
+            row = conn.execute("SELECT MAX(trade_date) AS d FROM daily").fetchone()
+            max_daily = row["d"] if row else None
+            row = conn.execute("SELECT MAX(trade_date) AS d FROM update_log").fetchone()
+            max_log = row["d"] if row else None
+            row = conn.execute("SELECT COUNT(*) AS n FROM daily").fetchone()
+            total_rows = int(row["n"]) if row else 0
+            row = conn.execute("SELECT COUNT(DISTINCT ts_code) AS n FROM daily").fetchone()
+            total_stocks = int(row["n"]) if row else 0
         return StatusResponse(
             today=format_yyyymmdd(_date.today()),
             cache_dir=str(settings.cache_dir),
@@ -436,7 +1017,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             rows=total_rows,
         )
 
-    @app.post("/v1/update", dependencies=[Depends(_api_key_required)])
+    @app.post("/v1/update", dependencies=[Depends(_admin_required)])
     def update(req: UpdateRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
         try:
             update_daily_service(settings=settings, start=req.start, end=req.end, provider=req.provider, repair_days=req.repair_days)
@@ -453,53 +1034,59 @@ def create_app(*, settings: Settings) -> FastAPI:
             "max_update_log_trade_date": backend.max_trade_date_in_update_log(),
         }
 
-    @app.post("/v1/update/wait", response_model=UpdateWaitResponse, dependencies=[Depends(_api_key_required)])
-    def update_wait(req: UpdateWaitRequest, settings: Settings = Depends(_settings_dep)) -> UpdateWaitResponse:
+    @app.post("/v1/update/wait", response_model=UpdateWaitResponse, dependencies=[Depends(_admin_required)])
+    def start_update_wait(req: UpdateWaitRequest, settings: Settings = Depends(_settings_dep)) -> UpdateWaitResponse:
         target = req.target_date or format_yyyymmdd(_date.today())
         try:
             parse_yyyymmdd(target)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-        backend = _backend(settings)
-        started = time.time()
-        attempts = 0
+        _cleanup_update_wait_jobs()
 
-        while True:
-            attempts += 1
-            try:
-                update_daily_service(settings=settings, start=None, end=target, provider=req.provider, repair_days=req.repair_days)
-            except (UpdateBadRequest, UpdateNotConfigured) as e:
-                raise HTTPException(status_code=400, detail=str(e)) from e
-            except UpdateIncomplete:
-                pass
-            except Exception:
-                pass
+        with update_wait_jobs_lock:
+            for job in update_wait_jobs.values():
+                if job.status != "running":
+                    continue
+                if job.provider == req.provider and job.target_date == target:
+                    return _update_wait_job_response(job)
 
-            backend = _backend(settings)
-            latest = backend.max_trade_date_in_daily()
-            if latest == target and backend.count_daily_rows_for_trade_date(target) > 0:
-                return UpdateWaitResponse(
-                    ok=True,
-                    target_date=target,
-                    latest_trade_date=latest,
-                    attempts=attempts,
-                    elapsed_seconds=time.time() - started,
-                    message="daily data available",
-                )
+            job_id = uuid.uuid4().hex
+            job = _UpdateWaitJob(
+                job_id=job_id,
+                provider=req.provider,
+                target_date=target,
+                repair_days=req.repair_days,
+                interval_seconds=req.interval_seconds,
+                timeout_seconds=req.timeout_seconds,
+                started_at=time.time(),
+            )
+            update_wait_jobs[job_id] = job
 
-            if time.time() - started >= req.timeout_seconds:
-                return UpdateWaitResponse(
-                    ok=False,
-                    target_date=target,
-                    latest_trade_date=latest,
-                    attempts=attempts,
-                    elapsed_seconds=time.time() - started,
-                    message="timeout waiting for daily data",
-                )
-            time.sleep(req.interval_seconds)
+        t = threading.Thread(target=_run_update_wait_job, kwargs={"job_id": job_id, "settings": settings}, daemon=True)
+        t.start()
+        return _update_wait_job_response(job)
 
-    @app.post("/v1/screen", response_model=ScreenResponse, dependencies=[Depends(_api_key_required)])
+    @app.get("/v1/update/wait/{job_id}", response_model=UpdateWaitResponse, dependencies=[Depends(_admin_required)])
+    def get_update_wait(job_id: str) -> UpdateWaitResponse:
+        with update_wait_jobs_lock:
+            job = update_wait_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="job not found")
+            return _update_wait_job_response(job)
+
+    @app.delete("/v1/update/wait/{job_id}", response_model=UpdateWaitResponse, dependencies=[Depends(_admin_required)])
+    def cancel_update_wait(job_id: str) -> UpdateWaitResponse:
+        with update_wait_jobs_lock:
+            job = update_wait_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="job not found")
+            if job.status == "running":
+                job.message = "cancel requested"
+                job.cancel_event.set()
+            return _update_wait_job_response(job)
+
+    @app.post("/v1/screen", response_model=ScreenResponse, dependencies=[Depends(_access_required)])
     def screen(req: ScreenRequest, settings: Settings = Depends(_settings_dep)) -> ScreenResponse:
         backend = _backend(settings)
         date_value: str
@@ -530,7 +1117,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e)) from e
         return ScreenResponse(trade_date=date_value, hits=df.to_dict(orient="records"))
 
-    @app.get("/v1/data/availability", response_model=AvailabilityResponse, dependencies=[Depends(_api_key_required)])
+    @app.get("/v1/data/availability", response_model=AvailabilityResponse, dependencies=[Depends(_access_required)])
     def availability(
         provider: Literal["baostock", "tushare"] = Query(default="baostock"),
         date: str = Query(..., description="YYYYMMDD"),
@@ -574,7 +1161,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         finally:
             bs.logout()
 
-    @app.post("/v1/export/ebk", dependencies=[Depends(_api_key_required)])
+    @app.post("/v1/export/ebk", dependencies=[Depends(_access_required)])
     def export_ebk(req: ScreenRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
         backend = _backend(settings)
         if req.date == "latest":
@@ -614,18 +1201,15 @@ def create_app(*, settings: Settings) -> FastAPI:
         content = ("\r\n" if fmt.leading_crlf else "") + "\r\n".join(ebk_codes) + ("\r\n" if fmt.trailing_crlf else "")
         return {"trade_date": date_value, "ebk": content}
 
-    @app.get("/v1/stocks", response_model=StockListResponse, dependencies=[Depends(_api_key_required)])
+    @app.get("/v1/stocks", response_model=StockListResponse, dependencies=[Depends(_access_required)])
     def list_stocks(
         search: str | None = Query(default=None, description="Search by ts_code or name"),
         limit: int = Query(default=100, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
         settings: Settings = Depends(_settings_dep),
     ) -> StockListResponse:
-        import sqlite3 as _sqlite3
-
-        conn = _sqlite3.connect(str(settings.sqlite_path))
-        conn.row_factory = _sqlite3.Row
-        try:
+        backend = _backend(settings)
+        with backend.connect() as conn:
             cur = conn.cursor()
             search_raw = (search or "").strip()
             # Prefer stock_basic for listing/search; scanning DISTINCT over daily is expensive.
@@ -673,14 +1257,50 @@ def create_app(*, settings: Settings) -> FastAPI:
                 if pinyin_mode:
                     search_key = search_compact.lower()
                     if has_stock_basic:
-                        cur.execute(
-                            """
-                            SELECT sb.ts_code, sb.name
-                            FROM stock_basic sb
-                            WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
-                            ORDER BY sb.ts_code
-                            """
-                        )
+                        ts_code_like = f"%{search_key}%"
+                        pinyin_like = f"{search_key}%"
+                        try:
+                            cur.execute(
+                                """
+                                SELECT sb.ts_code, sb.name
+                                FROM stock_basic sb
+                                WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                                  AND (
+                                    LOWER(sb.ts_code) LIKE ?
+                                    OR sb.pinyin_initials LIKE ?
+                                    OR sb.pinyin_full LIKE ?
+                                  )
+                                ORDER BY sb.ts_code
+                                LIMIT ? OFFSET ?
+                                """,
+                                (ts_code_like, pinyin_like, pinyin_like, limit, offset),
+                            )
+                            stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
+                            cur.execute(
+                                """
+                                SELECT COUNT(*) as cnt
+                                FROM stock_basic sb
+                                WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                                  AND (
+                                    LOWER(sb.ts_code) LIKE ?
+                                    OR sb.pinyin_initials LIKE ?
+                                    OR sb.pinyin_full LIKE ?
+                                  )
+                                """,
+                                (ts_code_like, pinyin_like, pinyin_like),
+                            )
+                            total = cur.fetchone()["cnt"]
+                            return StockListResponse(total=total, stocks=stocks)
+                        except sqlite3.OperationalError:
+                            # Fallback for legacy DB schema without pinyin cache columns.
+                            cur.execute(
+                                """
+                                SELECT sb.ts_code, sb.name
+                                FROM stock_basic sb
+                                WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                                ORDER BY sb.ts_code
+                                """
+                            )
                     else:
                         cur.execute(
                             """
@@ -755,11 +1375,9 @@ def create_app(*, settings: Settings) -> FastAPI:
                             (search_pattern, search_pattern),
                         )
                         total = cur.fetchone()["cnt"]
-        finally:
-            conn.close()
         return StockListResponse(total=total, stocks=stocks)
 
-    @app.get("/v1/stocks/{ts_code}/daily", response_model=StockDailyResponse, dependencies=[Depends(_api_key_required)])
+    @app.get("/v1/stocks/{ts_code}/daily", response_model=StockDailyResponse, dependencies=[Depends(_access_required)])
     def get_stock_daily(
         ts_code: str,
         start: str | None = Query(default=None, description="Start date YYYYMMDD"),
@@ -767,11 +1385,23 @@ def create_app(*, settings: Settings) -> FastAPI:
         limit: int = Query(default=250, ge=1, le=1000),
         settings: Settings = Depends(_settings_dep),
     ) -> StockDailyResponse:
-        import sqlite3 as _sqlite3
+        start_parsed = None
+        end_parsed = None
+        if start is not None:
+            try:
+                start_parsed = parse_yyyymmdd(start)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+        if end is not None:
+            try:
+                end_parsed = parse_yyyymmdd(end)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+        if start_parsed is not None and end_parsed is not None and start_parsed > end_parsed:
+            raise HTTPException(status_code=400, detail="start must be <= end")
 
-        conn = _sqlite3.connect(str(settings.sqlite_path))
-        conn.row_factory = _sqlite3.Row
-        try:
+        backend = _backend(settings)
+        with backend.connect() as conn:
             cur = conn.cursor()
             # Get stock name
             cur.execute("SELECT name FROM stock_basic WHERE ts_code = ?", (ts_code,))
@@ -804,15 +1434,13 @@ def create_app(*, settings: Settings) -> FastAPI:
                 )
                 for row in reversed(rows)  # Return in ascending order
             ]
-        finally:
-            conn.close()
 
         if not bars:
             raise HTTPException(status_code=404, detail=f"No data found for {ts_code}")
 
         return StockDailyResponse(ts_code=ts_code, name=name, bars=bars)
 
-    @app.post("/v1/sync-stock-names", dependencies=[Depends(_api_key_required)])
+    @app.post("/v1/sync-stock-names", dependencies=[Depends(_admin_required)])
     def sync_stock_names(settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
         """Sync stock names from baostock."""
         from stock_screener.providers.baostock_provider import BaoStockProvider
@@ -854,7 +1482,7 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.get(
         "/v1/watchlist",
         response_model=WatchlistStateResponse,
-        dependencies=[Depends(_api_key_required)],
+        dependencies=[Depends(_access_required)],
     )
     def get_watchlist(
         settings: Settings = Depends(_settings_dep),
@@ -908,7 +1536,7 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.post(
         "/v1/watchlist/groups",
         response_model=WatchlistGroupMeta,
-        dependencies=[Depends(_api_key_required)],
+        dependencies=[Depends(_access_required)],
     )
     def create_watchlist_group(
         req: WatchlistGroupCreate,
@@ -936,7 +1564,7 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.put(
         "/v1/watchlist/groups/{group_id}",
         response_model=WatchlistGroupMeta,
-        dependencies=[Depends(_api_key_required)],
+        dependencies=[Depends(_access_required)],
     )
     def update_watchlist_group(
         group_id: str,
@@ -966,7 +1594,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     @app.delete(
         "/v1/watchlist/groups/{group_id}",
-        dependencies=[Depends(_api_key_required)],
+        dependencies=[Depends(_access_required)],
     )
     def delete_watchlist_group(
         group_id: str,
@@ -995,7 +1623,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     @app.post(
         "/v1/watchlist/groups/{group_id}/items",
-        dependencies=[Depends(_api_key_required)],
+        dependencies=[Depends(_access_required)],
     )
     def upsert_watchlist_items(
         group_id: str,
@@ -1087,7 +1715,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     @app.post(
         "/v1/watchlist/groups/{group_id}/items/remove",
-        dependencies=[Depends(_api_key_required)],
+        dependencies=[Depends(_access_required)],
     )
     def remove_watchlist_items(
         group_id: str,
@@ -1131,7 +1759,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     # Formula CRUD endpoints
 
-    @app.get("/v1/formulas", response_model=FormulaListResponse, dependencies=[Depends(_api_key_required)])
+    @app.get("/v1/formulas", response_model=FormulaListResponse, dependencies=[Depends(_access_required)])
     def list_formulas(
         enabled_only: bool = Query(default=False, description="Only return enabled formulas"),
         kind: Literal["screen", "indicator"] | None = Query(default=None, description="Filter by formula kind"),
@@ -1145,7 +1773,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             formulas=[FormulaItem(**f) for f in formulas],
         )
 
-    @app.post("/v1/formulas", response_model=FormulaItem, dependencies=[Depends(_api_key_required)])
+    @app.post("/v1/formulas", response_model=FormulaItem, dependencies=[Depends(_admin_required)])
     def create_formula(
         req: FormulaCreate,
         settings: Settings = Depends(_settings_dep),
@@ -1177,7 +1805,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
 
-    @app.get("/v1/formulas/{formula_id}", response_model=FormulaItem, dependencies=[Depends(_api_key_required)])
+    @app.get("/v1/formulas/{formula_id}", response_model=FormulaItem, dependencies=[Depends(_access_required)])
     def get_formula(
         formula_id: int,
         settings: Settings = Depends(_settings_dep),
@@ -1189,7 +1817,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Formula {formula_id} not found")
         return FormulaItem(**formula)
 
-    @app.put("/v1/formulas/{formula_id}", response_model=FormulaItem, dependencies=[Depends(_api_key_required)])
+    @app.put("/v1/formulas/{formula_id}", response_model=FormulaItem, dependencies=[Depends(_admin_required)])
     def update_formula(
         formula_id: int,
         req: FormulaUpdate,
@@ -1231,7 +1859,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)) from e
 
-    @app.delete("/v1/formulas/{formula_id}", dependencies=[Depends(_api_key_required)])
+    @app.delete("/v1/formulas/{formula_id}", dependencies=[Depends(_admin_required)])
     def delete_formula(
         formula_id: int,
         settings: Settings = Depends(_settings_dep),
@@ -1242,7 +1870,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Formula {formula_id} not found")
         return {"ok": True, "deleted": formula_id}
 
-    @app.post("/v1/formulas/validate", response_model=FormulaValidateResponse, dependencies=[Depends(_api_key_required)])
+    @app.post("/v1/formulas/validate", response_model=FormulaValidateResponse, dependencies=[Depends(_access_required)])
     def validate_formula_endpoint(
         req: FormulaValidateRequest,
     ) -> FormulaValidateResponse:
@@ -1255,7 +1883,7 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.get(
         "/v1/stocks/{ts_code}/indicators/{formula_id}",
         response_model=IndicatorSeriesResponse,
-        dependencies=[Depends(_api_key_required)],
+        dependencies=[Depends(_access_required)],
     )
     def get_indicator_series(
         ts_code: str,
@@ -1286,12 +1914,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         if timeframe not in ("D", "W", "M"):
             raise HTTPException(status_code=400, detail=f"Invalid indicator timeframe: {timeframe}")
 
-        import sqlite3 as _sqlite3
-
-        conn = _sqlite3.connect(str(settings.sqlite_path))
-        conn.row_factory = _sqlite3.Row
-        try:
-            cur = conn.cursor()
+        with backend.connect() as conn:
             query = "SELECT trade_date, open, high, low, close, vol, amount FROM daily WHERE ts_code = ?"
             params: list[Any] = [ts_code]
             if start:
@@ -1302,10 +1925,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                 params.append(end)
             query += " ORDER BY trade_date DESC LIMIT ?"
             params.append(limit)
-            cur.execute(query, params)
-            rows = cur.fetchall()
-        finally:
-            conn.close()
+            rows = conn.execute(query, params).fetchall()
 
         if not rows:
             raise HTTPException(status_code=404, detail=f"No data found for {ts_code}")
@@ -1395,6 +2015,18 @@ def create_app_from_env() -> FastAPI:
       - STOCK_SCREENER_CACHE_DIR: default ./data
       - STOCK_SCREENER_DATA_BACKEND: default sqlite
       - STOCK_SCREENER_API_KEY: optional (require X-API-Key)
+      - STOCK_SCREENER_AUTH_ENABLED: optional (require Authorization: Bearer ... for /v1/*)
+      - STOCK_SCREENER_AUTH_SECRET: required when auth enabled
+      - STOCK_SCREENER_AUTH_TOKEN_TTL_SECONDS: optional, default 30 days
+      - STOCK_SCREENER_AUTH_SIGNUP_MODE: open|email|closed (default: open; first user can always register)
+      - STOCK_SCREENER_AUTH_ALLOWED_EMAIL_DOMAINS: optional, comma-separated domains (email signup only)
+      - STOCK_SCREENER_AUTH_EMAIL_CODE_TTL_SECONDS: optional, default 600
+      - STOCK_SCREENER_AUTH_EMAIL_CODE_COOLDOWN_SECONDS: optional, default 60
+      - STOCK_SCREENER_AUTH_EMAIL_CODE_MAX_ATTEMPTS: optional, default 5
+      - STOCK_SCREENER_AUTH_EMAIL_DEBUG_RETURN_CODE: optional, return code in API response (dev only)
+      - STOCK_SCREENER_SMTP_HOST/PORT/USERNAME/PASSWORD/FROM: required for email signup (unless debug)
+      - STOCK_SCREENER_SMTP_TLS: optional, default 1 (STARTTLS)
+      - STOCK_SCREENER_SMTP_SSL: optional, default 0
       - STOCK_SCREENER_CORS_ORIGINS: optional comma-separated origins
     """
 
