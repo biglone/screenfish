@@ -99,8 +99,11 @@ class SqliteBackend:
                   password_salt TEXT NOT NULL,
                   role TEXT NOT NULL DEFAULT 'user',
                   disabled INTEGER NOT NULL DEFAULT 0,
+                  token_version INTEGER NOT NULL DEFAULT 0,
                   created_at INTEGER NOT NULL,
-                  updated_at INTEGER NOT NULL
+                  updated_at INTEGER NOT NULL,
+                  last_login_at INTEGER,
+                  last_login_ip TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
 
@@ -117,6 +120,22 @@ class SqliteBackend:
                 );
                 CREATE INDEX IF NOT EXISTS idx_email_verification_codes_expires_at
                   ON email_verification_codes (expires_at);
+
+                CREATE TABLE IF NOT EXISTS auto_update_config (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  enabled INTEGER NOT NULL DEFAULT 0,
+                  interval_seconds INTEGER NOT NULL DEFAULT 600,
+                  provider TEXT NOT NULL DEFAULT 'baostock',
+                  repair_days INTEGER NOT NULL DEFAULT 30,
+                  last_run_at INTEGER,
+                  last_success_at INTEGER,
+                  last_success_trade_date TEXT,
+                  last_error TEXT,
+                  updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO auto_update_config
+                  (id, enabled, interval_seconds, provider, repair_days, updated_at)
+                VALUES (1, 0, 600, 'baostock', 30, 0);
                 """
             )
             self._migrate(conn)
@@ -145,6 +164,12 @@ class SqliteBackend:
                   WHERE email IS NOT NULL
                 """
             )
+        if _has_column("users", "id") and not _has_column("users", "token_version"):
+            conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+        if _has_column("users", "id") and not _has_column("users", "last_login_at"):
+            conn.execute("ALTER TABLE users ADD COLUMN last_login_at INTEGER")
+        if _has_column("users", "id") and not _has_column("users", "last_login_ip"):
+            conn.execute("ALTER TABLE users ADD COLUMN last_login_ip TEXT")
 
         # stock_basic: add pinyin cache columns for fast search.
         if _has_column("stock_basic", "ts_code") and not _has_column("stock_basic", "pinyin_initials"):

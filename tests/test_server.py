@@ -74,6 +74,35 @@ def test_health_and_status(tmp_path: Path) -> None:
     assert body["stocks"] == 1
 
 
+def test_auto_update_config_defaults_and_update(tmp_path: Path) -> None:
+    settings = _seed_sqlite(tmp_path)
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.get("/auto-update-config")
+    assert r.status_code == 200
+    cfg = r.json()
+    assert cfg["enabled"] is False
+    assert cfg["interval_seconds"] == 600
+    assert cfg["provider"] == "baostock"
+    assert cfg["repair_days"] == 30
+
+    r2 = client.put(
+        "/auto-update-config",
+        json={"enabled": True, "interval_seconds": 1200, "provider": "tushare", "repair_days": 15},
+    )
+    assert r2.status_code == 200
+    cfg2 = r2.json()
+    assert cfg2["enabled"] is True
+    assert cfg2["interval_seconds"] == 1200
+    assert cfg2["provider"] == "tushare"
+    assert cfg2["repair_days"] == 15
+
+    r3 = client.get("/auto-update-config")
+    assert r3.status_code == 200
+    assert r3.json() == cfg2
+
+
 def test_screen_latest(tmp_path: Path) -> None:
     settings = _seed_sqlite(tmp_path)
     app = create_app(settings=settings)
@@ -169,6 +198,9 @@ def test_auth_register_login_and_isolation(tmp_path: Path, monkeypatch) -> None:
     r0 = client.get("/v1/status")
     assert r0.status_code == 401
 
+    r0b = client.get("/auto-update-config")
+    assert r0b.status_code == 401
+
     r1 = client.post("/v1/auth/register", json={"username": "admin", "password": "password123"})
     assert r1.status_code == 200
     tok1 = r1.json()["token"]
@@ -191,6 +223,12 @@ def test_auth_register_login_and_isolation(tmp_path: Path, monkeypatch) -> None:
     assert r5.status_code == 200
     tok2 = r5.json()["token"]
     assert r5.json()["user"]["role"] == "user"
+
+    r5b = client.get("/auto-update-config", headers={"Authorization": f"Bearer {tok2}"})
+    assert r5b.status_code == 403
+
+    r5c = client.get("/auto-update-config", headers={"Authorization": f"Bearer {tok1b}"})
+    assert r5c.status_code == 200
 
     r6 = client.post(
         "/v1/formulas",
@@ -365,3 +403,197 @@ def test_update_wait_baostock_succeeds_after_update(tmp_path: Path, monkeypatch)
 
     assert status == "succeeded"
     assert calls["update"] == 1
+
+
+def test_admin_user_management_and_token_revocation(tmp_path: Path, monkeypatch) -> None:
+    settings = _seed_sqlite(tmp_path)
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_ENABLED", "1")
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_SECRET", "test-secret")
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_SIGNUP_MODE", "open")
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r1 = client.post("/v1/auth/register", json={"username": "admin", "password": "password123"})
+    assert r1.status_code == 200
+    admin_tok = r1.json()["token"]
+    admin_id = r1.json()["user"]["id"]
+    assert r1.json()["user"]["role"] == "admin"
+    admin_headers = {"Authorization": f"Bearer {admin_tok}"}
+
+    r2 = client.post("/v1/auth/register", json={"username": "user1", "password": "password123"})
+    assert r2.status_code == 200
+    user_tok = r2.json()["token"]
+    user_id = r2.json()["user"]["id"]
+    assert r2.json()["user"]["role"] == "user"
+    user_headers = {"Authorization": f"Bearer {user_tok}"}
+
+    r3 = client.get("/v1/admin/users", headers=admin_headers)
+    assert r3.status_code == 200
+    body = r3.json()
+    assert body["total"] >= 2
+    ids = {u["id"] for u in body["users"]}
+    assert admin_id in ids
+    assert user_id in ids
+
+    r4 = client.get("/v1/admin/users", headers=user_headers)
+    assert r4.status_code == 403
+
+    r5 = client.post(
+        "/v1/admin/users",
+        json={"username": "user2", "password": "password123", "email": "user2@example.com"},
+        headers=admin_headers,
+    )
+    assert r5.status_code == 200
+    user2 = r5.json()
+    assert user2["username"] == "user2"
+    assert user2["email"] == "user2@example.com"
+    assert user2["role"] == "user"
+    assert user2["disabled"] is False
+
+    # Prevent lockout: you cannot disable the last enabled admin.
+    r6 = client.put(f"/v1/admin/users/{admin_id}", json={"disabled": True}, headers=admin_headers)
+    assert r6.status_code == 400
+
+    # Disable user -> old token becomes unusable.
+    r7 = client.put(f"/v1/admin/users/{user_id}", json={"disabled": True}, headers=admin_headers)
+    assert r7.status_code == 200
+    assert r7.json()["disabled"] is True
+
+    r8 = client.get("/v1/auth/me", headers=user_headers)
+    assert r8.status_code == 401
+
+    # Re-enable user; previous token remains invalid due to token_version bump.
+    r9 = client.put(f"/v1/admin/users/{user_id}", json={"disabled": False}, headers=admin_headers)
+    assert r9.status_code == 200
+    assert r9.json()["disabled"] is False
+
+    r10 = client.get("/v1/auth/me", headers=user_headers)
+    assert r10.status_code == 401
+
+    r11 = client.post("/v1/auth/login", json={"username": "user1", "password": "password123"})
+    assert r11.status_code == 200
+    user_tok2 = r11.json()["token"]
+    user_headers2 = {"Authorization": f"Bearer {user_tok2}"}
+
+    r12 = client.get("/v1/auth/me", headers=user_headers2)
+    assert r12.status_code == 200
+
+    # Reset password -> invalidates existing tokens.
+    r13 = client.post(
+        f"/v1/admin/users/{user_id}/set-password",
+        json={"password": "newpassword123"},
+        headers=admin_headers,
+    )
+    assert r13.status_code == 200
+    assert isinstance(r13.json()["token_version"], int)
+
+    r14 = client.get("/v1/auth/me", headers=user_headers2)
+    assert r14.status_code == 401
+
+    r15 = client.post("/v1/auth/login", json={"username": "user1", "password": "password123"})
+    assert r15.status_code == 401
+    r16 = client.post("/v1/auth/login", json={"username": "user1", "password": "newpassword123"})
+    assert r16.status_code == 200
+
+    # Explicit token revocation.
+    tok3 = r16.json()["token"]
+    user_headers3 = {"Authorization": f"Bearer {tok3}"}
+    r17 = client.get("/v1/auth/me", headers=user_headers3)
+    assert r17.status_code == 200
+
+    r18 = client.post(f"/v1/admin/users/{user_id}/revoke-tokens", headers=admin_headers)
+    assert r18.status_code == 200
+    assert isinstance(r18.json()["token_version"], int)
+
+    r19 = client.get("/v1/auth/me", headers=user_headers3)
+    assert r19.status_code == 401
+
+
+def test_account_update_email_and_change_password(tmp_path: Path, monkeypatch) -> None:
+    settings = _seed_sqlite(tmp_path)
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_ENABLED", "1")
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_SECRET", "test-secret")
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_SIGNUP_MODE", "open")
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r1 = client.post("/v1/auth/register", json={"username": "user1", "password": "password123"})
+    assert r1.status_code == 200
+    tok1 = r1.json()["token"]
+    uid1 = r1.json()["user"]["id"]
+    headers1 = {"Authorization": f"Bearer {tok1}"}
+
+    r2 = client.get("/v1/account", headers=headers1)
+    assert r2.status_code == 200
+    assert r2.json()["id"] == uid1
+    assert r2.json()["email"] is None
+
+    r3 = client.put(
+        "/v1/account",
+        json={"email": "user1@example.com", "current_password": "wrong"},
+        headers=headers1,
+    )
+    assert r3.status_code == 401
+
+    r4 = client.put(
+        "/v1/account",
+        json={"email": "user1@example.com", "current_password": "password123"},
+        headers=headers1,
+    )
+    assert r4.status_code == 200
+    assert r4.json()["email"] == "user1@example.com"
+
+    r5 = client.post("/v1/auth/login", json={"username": "user1@example.com", "password": "password123"})
+    assert r5.status_code == 200
+
+    r6 = client.post("/v1/auth/register", json={"username": "user2", "password": "password123"})
+    assert r6.status_code == 200
+    tok2 = r6.json()["token"]
+    headers2 = {"Authorization": f"Bearer {tok2}"}
+    r7 = client.put(
+        "/v1/account",
+        json={"email": "user1@example.com", "current_password": "password123"},
+        headers=headers2,
+    )
+    assert r7.status_code == 409
+
+    r8 = client.post(
+        "/v1/account/change-password",
+        json={"current_password": "wrong", "new_password": "newpassword123"},
+        headers=headers1,
+    )
+    assert r8.status_code == 401
+
+    r9 = client.post(
+        "/v1/account/change-password",
+        json={"current_password": "password123", "new_password": "newpassword123"},
+        headers=headers1,
+    )
+    assert r9.status_code == 200
+    tok1_new = r9.json()["token"]
+    headers1_new = {"Authorization": f"Bearer {tok1_new}"}
+
+    r10 = client.get("/v1/auth/me", headers=headers1)
+    assert r10.status_code == 401
+    r11 = client.get("/v1/auth/me", headers=headers1_new)
+    assert r11.status_code == 200
+
+    r12 = client.post("/v1/auth/login", json={"username": "user1", "password": "password123"})
+    assert r12.status_code == 401
+    r13 = client.post("/v1/auth/login", json={"username": "user1", "password": "newpassword123"})
+    assert r13.status_code == 200
+
+    r14 = client.post("/v1/auth/login", json={"username": "user1@example.com", "password": "newpassword123"})
+    assert r14.status_code == 200
+
+    # Clearing email disables email login.
+    r15 = client.put(
+        "/v1/account",
+        json={"email": None, "current_password": "newpassword123"},
+        headers=headers1_new,
+    )
+    assert r15.status_code == 200
+    assert r15.json()["email"] is None
+
+    r16 = client.post("/v1/auth/login", json={"username": "user1@example.com", "password": "newpassword123"})
+    assert r16.status_code == 401
