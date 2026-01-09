@@ -345,3 +345,93 @@ def test_admin_user_management_and_token_revocation(tmp_path: Path, monkeypatch)
 
     r19 = client.get("/v1/auth/me", headers=user_headers3)
     assert r19.status_code == 401
+
+
+def test_account_update_email_and_change_password(tmp_path: Path, monkeypatch) -> None:
+    settings = _seed_sqlite(tmp_path)
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_ENABLED", "1")
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_SECRET", "test-secret")
+    monkeypatch.setenv("STOCK_SCREENER_AUTH_SIGNUP_MODE", "open")
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r1 = client.post("/v1/auth/register", json={"username": "user1", "password": "password123"})
+    assert r1.status_code == 200
+    tok1 = r1.json()["token"]
+    uid1 = r1.json()["user"]["id"]
+    headers1 = {"Authorization": f"Bearer {tok1}"}
+
+    r2 = client.get("/v1/account", headers=headers1)
+    assert r2.status_code == 200
+    assert r2.json()["id"] == uid1
+    assert r2.json()["email"] is None
+
+    r3 = client.put(
+        "/v1/account",
+        json={"email": "user1@example.com", "current_password": "wrong"},
+        headers=headers1,
+    )
+    assert r3.status_code == 401
+
+    r4 = client.put(
+        "/v1/account",
+        json={"email": "user1@example.com", "current_password": "password123"},
+        headers=headers1,
+    )
+    assert r4.status_code == 200
+    assert r4.json()["email"] == "user1@example.com"
+
+    r5 = client.post("/v1/auth/login", json={"username": "user1@example.com", "password": "password123"})
+    assert r5.status_code == 200
+
+    r6 = client.post("/v1/auth/register", json={"username": "user2", "password": "password123"})
+    assert r6.status_code == 200
+    tok2 = r6.json()["token"]
+    headers2 = {"Authorization": f"Bearer {tok2}"}
+    r7 = client.put(
+        "/v1/account",
+        json={"email": "user1@example.com", "current_password": "password123"},
+        headers=headers2,
+    )
+    assert r7.status_code == 409
+
+    r8 = client.post(
+        "/v1/account/change-password",
+        json={"current_password": "wrong", "new_password": "newpassword123"},
+        headers=headers1,
+    )
+    assert r8.status_code == 401
+
+    r9 = client.post(
+        "/v1/account/change-password",
+        json={"current_password": "password123", "new_password": "newpassword123"},
+        headers=headers1,
+    )
+    assert r9.status_code == 200
+    tok1_new = r9.json()["token"]
+    headers1_new = {"Authorization": f"Bearer {tok1_new}"}
+
+    r10 = client.get("/v1/auth/me", headers=headers1)
+    assert r10.status_code == 401
+    r11 = client.get("/v1/auth/me", headers=headers1_new)
+    assert r11.status_code == 200
+
+    r12 = client.post("/v1/auth/login", json={"username": "user1", "password": "password123"})
+    assert r12.status_code == 401
+    r13 = client.post("/v1/auth/login", json={"username": "user1", "password": "newpassword123"})
+    assert r13.status_code == 200
+
+    r14 = client.post("/v1/auth/login", json={"username": "user1@example.com", "password": "newpassword123"})
+    assert r14.status_code == 200
+
+    # Clearing email disables email login.
+    r15 = client.put(
+        "/v1/account",
+        json={"email": None, "current_password": "newpassword123"},
+        headers=headers1_new,
+    )
+    assert r15.status_code == 200
+    assert r15.json()["email"] is None
+
+    r16 = client.post("/v1/auth/login", json={"username": "user1@example.com", "password": "newpassword123"})
+    assert r16.status_code == 401

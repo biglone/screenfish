@@ -299,6 +299,23 @@ class AuthTokenResponse(BaseModel):
     user: AuthUserResponse
 
 
+class AccountResponse(BaseModel):
+    id: str
+    username: str
+    email: str | None = None
+    role: Literal["admin", "user"]
+
+
+class AccountUpdateRequest(BaseModel):
+    email: str | None = Field(..., max_length=254)
+    current_password: str = Field(..., min_length=1, max_length=128)
+
+
+class AccountChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 class AdminUserItem(BaseModel):
     id: str
     username: str
@@ -1063,6 +1080,142 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.get("/v1/auth/me", response_model=AuthUserResponse, dependencies=[Depends(_auth_enabled_required)])
     def me(user: AuthUser = Depends(_access_required)) -> AuthUserResponse:
         return AuthUserResponse(id=user.id, username=user.username, role=user.role)
+
+    def _account_from_row(row: sqlite3.Row) -> AccountResponse:
+        role = str(row["role"] or "user")
+        if role not in {"admin", "user"}:
+            role = "user"
+        return AccountResponse(
+            id=str(row["id"]),
+            username=str(row["username"]),
+            email=str(row["email"]) if row["email"] is not None else None,
+            role=role,  # type: ignore[arg-type]
+        )
+
+    @app.get(
+        "/v1/account",
+        response_model=AccountResponse,
+        dependencies=[Depends(_auth_enabled_required)],
+    )
+    def account_me(user: AuthUser = Depends(_access_required), settings: Settings = Depends(_settings_dep)) -> AccountResponse:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT id, username, email, role, disabled FROM users WHERE id = ? LIMIT 1",
+                (user.id,),
+            ).fetchone()
+        if not row or int(row["disabled"] or 0) != 0:
+            raise HTTPException(status_code=401, detail="invalid token")
+        return _account_from_row(row)
+
+    @app.put(
+        "/v1/account",
+        response_model=AccountResponse,
+        dependencies=[Depends(_auth_enabled_required)],
+    )
+    def account_update(
+        req: AccountUpdateRequest,
+        user: AuthUser = Depends(_access_required),
+        settings: Settings = Depends(_settings_dep),
+    ) -> AccountResponse:
+        email_raw = (req.email or "").strip()
+        if not email_raw:
+            email: str | None = None
+        else:
+            try:
+                email = validate_email(email_raw)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="invalid email")
+
+        backend = _backend(settings)
+        now = int(time.time())
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT id, password_hash, password_salt, disabled FROM users WHERE id = ? LIMIT 1",
+                (user.id,),
+            ).fetchone()
+            if not row or int(row["disabled"] or 0) != 0:
+                raise HTTPException(status_code=401, detail="invalid token")
+            if not verify_password(req.current_password, str(row["password_hash"]), str(row["password_salt"])):
+                raise HTTPException(status_code=401, detail="invalid password")
+            if email and conn.execute(
+                "SELECT 1 FROM users WHERE email = ? AND id != ? LIMIT 1",
+                (email, user.id),
+            ).fetchone():
+                raise HTTPException(status_code=409, detail="email already registered")
+
+            conn.execute(
+                "UPDATE users SET email = ?, updated_at = ? WHERE id = ?",
+                (email, now, user.id),
+            )
+            row2 = conn.execute(
+                "SELECT id, username, email, role, disabled FROM users WHERE id = ? LIMIT 1",
+                (user.id,),
+            ).fetchone()
+        if not row2 or int(row2["disabled"] or 0) != 0:
+            raise HTTPException(status_code=401, detail="invalid token")
+        return _account_from_row(row2)
+
+    @app.post(
+        "/v1/account/change-password",
+        response_model=AuthTokenResponse,
+        dependencies=[Depends(_auth_enabled_required)],
+    )
+    def account_change_password(
+        req: AccountChangePasswordRequest,
+        user: AuthUser = Depends(_access_required),
+        settings: Settings = Depends(_settings_dep),
+    ) -> AuthTokenResponse:
+        backend = _backend(settings)
+        now = int(time.time())
+        password_hash, password_salt = hash_password(req.new_password)
+        with backend.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, username, role, password_hash, password_salt, disabled
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (user.id,),
+            ).fetchone()
+            if not row or int(row["disabled"] or 0) != 0:
+                raise HTTPException(status_code=401, detail="invalid token")
+            if not verify_password(req.current_password, str(row["password_hash"]), str(row["password_salt"])):
+                raise HTTPException(status_code=401, detail="invalid password")
+
+            role = str(row["role"] or "user")
+            if role not in {"admin", "user"}:
+                role = "user"
+            username = str(row["username"])
+            user_id = str(row["id"])
+
+            conn.execute(
+                """
+                UPDATE users
+                SET password_hash = ?, password_salt = ?, token_version = token_version + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (password_hash, password_salt, now, user_id),
+            )
+            row2 = conn.execute(
+                "SELECT token_version FROM users WHERE id = ? LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if not row2:
+                raise HTTPException(status_code=401, detail="invalid token")
+            token_version = int(row2["token_version"] or 0)
+
+        secret = app.state.app_state.auth_secret
+        if secret is None:
+            raise HTTPException(status_code=500, detail="auth misconfigured")
+        expires_at = now + int(app.state.app_state.auth_token_ttl_seconds)
+        token = create_access_token({"uid": user_id, "tv": token_version}, secret=secret, expires_at=expires_at)
+        return AuthTokenResponse(
+            token=token,
+            expires_at=expires_at,
+            user=AuthUserResponse(id=user_id, username=username, role=role),  # type: ignore[arg-type]
+        )
 
     def _admin_user_item_from_row(row: sqlite3.Row) -> AdminUserItem:
         role = str(row["role"] or "user")
