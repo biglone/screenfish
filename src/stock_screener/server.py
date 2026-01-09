@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 import pandas as pd
 import typer
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
@@ -52,6 +52,17 @@ from stock_screener.pinyin import pinyin_full, pinyin_initials
 from stock_screener.runner import run_screen
 from stock_screener.tdx import TdxEbkFormat, ts_code_to_ebk_code
 from stock_screener.update import UpdateBadRequest, UpdateIncomplete, UpdateNotConfigured, update_daily_service
+
+
+def _client_ip(request: Request) -> str | None:
+    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded_for:
+        ip = forwarded_for.split(",", 1)[0].strip()
+        if ip:
+            return ip
+    if request.client is not None:
+        return request.client.host
+    return None
 
 
 def _api_key_required(x_api_key: str | None = Header(default=None)) -> None:
@@ -286,6 +297,48 @@ class AuthTokenResponse(BaseModel):
     token: str
     expires_at: int
     user: AuthUserResponse
+
+
+class AdminUserItem(BaseModel):
+    id: str
+    username: str
+    email: str | None = None
+    role: Literal["admin", "user"]
+    disabled: bool
+    token_version: int = 0
+    created_at: int
+    updated_at: int
+    last_login_at: int | None = None
+    last_login_ip: str | None = None
+
+
+class AdminUserListResponse(BaseModel):
+    total: int
+    users: list[AdminUserItem]
+
+
+class AdminUserCreateRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=128)
+    email: str | None = Field(default=None, min_length=3, max_length=254)
+    role: Literal["admin", "user"] = "user"
+    disabled: bool = False
+
+
+class AdminUserUpdateRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=3, max_length=50)
+    email: str | None = Field(default=None, min_length=3, max_length=254)
+    role: Literal["admin", "user"] | None = None
+    disabled: bool | None = None
+
+
+class AdminUserSetPasswordRequest(BaseModel):
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class AdminUserTokenVersionResponse(BaseModel):
+    ok: bool = True
+    token_version: int
 
 
 class AuthEmailCodeRequest(BaseModel):
@@ -660,14 +713,21 @@ def create_app(*, settings: Settings) -> FastAPI:
         user_id = str(claims.get("uid") or "").strip()
         if not user_id:
             raise HTTPException(status_code=401, detail="invalid token")
+        try:
+            token_version = int(claims.get("tv") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=401, detail="invalid token")
 
         backend = _backend(settings)
         with backend.connect() as conn:
             row = conn.execute(
-                "SELECT id, username, role, disabled FROM users WHERE id = ? LIMIT 1",
+                "SELECT id, username, role, disabled, token_version FROM users WHERE id = ? LIMIT 1",
                 (user_id,),
             ).fetchone()
         if not row or int(row["disabled"] or 0) != 0:
+            raise HTTPException(status_code=401, detail="invalid token")
+        db_token_version = int(row["token_version"] or 0)
+        if token_version != db_token_version:
             raise HTTPException(status_code=401, detail="invalid token")
         role = str(row["role"] or "user")
         if role not in {"admin", "user"}:
@@ -717,7 +777,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         }
 
     @app.post("/v1/auth/register", response_model=AuthTokenResponse, dependencies=[Depends(_auth_enabled_required)])
-    def register(req: AuthRegisterRequest, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
+    def register(req: AuthRegisterRequest, request: Request, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
         username = normalize_username(req.username)
         if len(username) < 3:
             raise HTTPException(status_code=400, detail="username too short")
@@ -743,12 +803,20 @@ def create_app(*, settings: Settings) -> FastAPI:
                 """,
                 (user_id, username, password_hash, password_salt, role, now, now),
             )
+            ip = _client_ip(request)
+            if ip:
+                conn.execute(
+                    "UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?",
+                    (now, ip, user_id),
+                )
+            else:
+                conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, user_id))
 
         secret = app.state.app_state.auth_secret
         if secret is None:
             raise HTTPException(status_code=500, detail="auth misconfigured")
         expires_at = now + int(app.state.app_state.auth_token_ttl_seconds)
-        token = create_access_token({"uid": user_id}, secret=secret, expires_at=expires_at)
+        token = create_access_token({"uid": user_id, "tv": 0}, secret=secret, expires_at=expires_at)
         return AuthTokenResponse(
             token=token,
             expires_at=expires_at,
@@ -837,7 +905,9 @@ def create_app(*, settings: Settings) -> FastAPI:
         response_model=AuthTokenResponse,
         dependencies=[Depends(_auth_enabled_required)],
     )
-    def register_email(req: AuthEmailRegisterRequest, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
+    def register_email(
+        req: AuthEmailRegisterRequest, request: Request, settings: Settings = Depends(_settings_dep)
+    ) -> AuthTokenResponse:
         if app.state.app_state.auth_signup_mode != "email":
             raise HTTPException(status_code=404, detail="Not Found")
 
@@ -913,12 +983,20 @@ def create_app(*, settings: Settings) -> FastAPI:
                 """,
                 (user_id, username, email, password_hash, password_salt, role, now, now),
             )
+            ip = _client_ip(request)
+            if ip:
+                conn.execute(
+                    "UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?",
+                    (now, ip, user_id),
+                )
+            else:
+                conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, user_id))
 
         secret = app.state.app_state.auth_secret
         if secret is None:
             raise HTTPException(status_code=500, detail="auth misconfigured")
         expires_at = now + int(app.state.app_state.auth_token_ttl_seconds)
-        token = create_access_token({"uid": user_id}, secret=secret, expires_at=expires_at)
+        token = create_access_token({"uid": user_id, "tv": 0}, secret=secret, expires_at=expires_at)
         return AuthTokenResponse(
             token=token,
             expires_at=expires_at,
@@ -926,7 +1004,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         )
 
     @app.post("/v1/auth/login", response_model=AuthTokenResponse, dependencies=[Depends(_auth_enabled_required)])
-    def login(req: AuthLoginRequest, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
+    def login(req: AuthLoginRequest, request: Request, settings: Settings = Depends(_settings_dep)) -> AuthTokenResponse:
         ident_raw = (req.username or "").strip()
         is_email = "@" in ident_raw
         if is_email:
@@ -939,41 +1017,329 @@ def create_app(*, settings: Settings) -> FastAPI:
             identifier = normalize_username(ident_raw)
             where = "username = ?"
         backend = _backend(settings)
+        now = int(time.time())
+        ip = _client_ip(request)
         with backend.connect() as conn:
             row = conn.execute(
                 f"""
-                SELECT id, username, role, password_hash, password_salt, disabled
+                SELECT id, username, role, password_hash, password_salt, disabled, token_version
                 FROM users
                 WHERE {where}
                 LIMIT 1
                 """,
                 (identifier,),
             ).fetchone()
-        if not row or int(row["disabled"] or 0) != 0:
-            raise HTTPException(status_code=401, detail="invalid username or password")
-        if not verify_password(req.password, str(row["password_hash"]), str(row["password_salt"])):
-            raise HTTPException(status_code=401, detail="invalid username or password")
+            if not row or int(row["disabled"] or 0) != 0:
+                raise HTTPException(status_code=401, detail="invalid username or password")
+            if not verify_password(req.password, str(row["password_hash"]), str(row["password_salt"])):
+                raise HTTPException(status_code=401, detail="invalid username or password")
 
-        role = str(row["role"] or "user")
-        if role not in {"admin", "user"}:
-            raise HTTPException(status_code=401, detail="invalid username or password")
-        user_id = str(row["id"])
+            role = str(row["role"] or "user")
+            if role not in {"admin", "user"}:
+                raise HTTPException(status_code=401, detail="invalid username or password")
+            user_id = str(row["id"])
+            username = str(row["username"])
+            token_version = int(row["token_version"] or 0)
+
+            if ip:
+                conn.execute(
+                    "UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?",
+                    (now, ip, user_id),
+                )
+            else:
+                conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, user_id))
 
         secret = app.state.app_state.auth_secret
         if secret is None:
             raise HTTPException(status_code=500, detail="auth misconfigured")
-        now = int(time.time())
         expires_at = now + int(app.state.app_state.auth_token_ttl_seconds)
-        token = create_access_token({"uid": user_id}, secret=secret, expires_at=expires_at)
+        token = create_access_token({"uid": user_id, "tv": token_version}, secret=secret, expires_at=expires_at)
         return AuthTokenResponse(
             token=token,
             expires_at=expires_at,
-            user=AuthUserResponse(id=user_id, username=str(row["username"]), role=role),  # type: ignore[arg-type]
+            user=AuthUserResponse(id=user_id, username=username, role=role),  # type: ignore[arg-type]
         )
 
     @app.get("/v1/auth/me", response_model=AuthUserResponse, dependencies=[Depends(_auth_enabled_required)])
     def me(user: AuthUser = Depends(_access_required)) -> AuthUserResponse:
         return AuthUserResponse(id=user.id, username=user.username, role=user.role)
+
+    def _admin_user_item_from_row(row: sqlite3.Row) -> AdminUserItem:
+        role = str(row["role"] or "user")
+        if role not in {"admin", "user"}:
+            role = "user"
+        last_login_at = row["last_login_at"]
+        return AdminUserItem(
+            id=str(row["id"]),
+            username=str(row["username"]),
+            email=str(row["email"]) if row["email"] is not None else None,
+            role=role,  # type: ignore[arg-type]
+            disabled=int(row["disabled"] or 0) != 0,
+            token_version=int(row["token_version"] or 0),
+            created_at=int(row["created_at"] or 0),
+            updated_at=int(row["updated_at"] or 0),
+            last_login_at=int(last_login_at) if last_login_at is not None else None,
+            last_login_ip=str(row["last_login_ip"]) if row["last_login_ip"] is not None else None,
+        )
+
+    def _enabled_admin_count(conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0").fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    @app.get(
+        "/v1/admin/users",
+        response_model=AdminUserListResponse,
+        dependencies=[Depends(_auth_enabled_required), Depends(_admin_required)],
+    )
+    def admin_list_users(
+        search: str | None = Query(default=None, max_length=100),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        settings: Settings = Depends(_settings_dep),
+    ) -> AdminUserListResponse:
+        search_raw = (search or "").strip().lower()
+        where = "1=1"
+        params: list[Any] = []
+        if search_raw:
+            where = "(LOWER(username) LIKE ? OR LOWER(COALESCE(email, '')) LIKE ?)"
+            like = f"%{search_raw}%"
+            params.extend([like, like])
+
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = conn.execute(f"SELECT COUNT(*) AS n FROM users WHERE {where}", params).fetchone()
+            total = int(row["n"] or 0) if row else 0
+            rows = conn.execute(
+                f"""
+                SELECT id, username, email, role, disabled, token_version, created_at, updated_at, last_login_at, last_login_ip
+                FROM users
+                WHERE {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                OFFSET ?
+                """,
+                [*params, limit, offset],
+            ).fetchall()
+        return AdminUserListResponse(total=total, users=[_admin_user_item_from_row(r) for r in rows])
+
+    @app.post(
+        "/v1/admin/users",
+        response_model=AdminUserItem,
+        dependencies=[Depends(_auth_enabled_required), Depends(_admin_required)],
+    )
+    def admin_create_user(req: AdminUserCreateRequest, settings: Settings = Depends(_settings_dep)) -> AdminUserItem:
+        username = normalize_username(req.username)
+        if len(username) < 3:
+            raise HTTPException(status_code=400, detail="username too short")
+        if len(req.password) < 8:
+            raise HTTPException(status_code=400, detail="password too short")
+
+        email: str | None
+        email_raw = (req.email or "").strip()
+        if not email_raw:
+            email = None
+        else:
+            try:
+                email = validate_email(email_raw)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="invalid email")
+
+        backend = _backend(settings)
+        now = int(time.time())
+        user_id = uuid.uuid4().hex
+        password_hash, password_salt = hash_password(req.password)
+        disabled = 1 if req.disabled else 0
+        role = req.role
+
+        with backend.connect() as conn:
+            if conn.execute("SELECT 1 FROM users WHERE username = ? LIMIT 1", (username,)).fetchone():
+                raise HTTPException(status_code=409, detail="username already exists")
+            if email and conn.execute("SELECT 1 FROM users WHERE email = ? LIMIT 1", (email,)).fetchone():
+                raise HTTPException(status_code=409, detail="email already registered")
+            conn.execute(
+                """
+                INSERT INTO users (id, username, email, password_hash, password_salt, role, disabled, token_version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (user_id, username, email, password_hash, password_salt, role, disabled, now, now),
+            )
+            row = conn.execute(
+                """
+                SELECT id, username, email, role, disabled, token_version, created_at, updated_at, last_login_at, last_login_ip
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="failed to create user")
+        return _admin_user_item_from_row(row)
+
+    @app.put(
+        "/v1/admin/users/{user_id}",
+        response_model=AdminUserItem,
+        dependencies=[Depends(_auth_enabled_required), Depends(_admin_required)],
+    )
+    def admin_update_user(
+        user_id: str,
+        req: AdminUserUpdateRequest,
+        settings: Settings = Depends(_settings_dep),
+    ) -> AdminUserItem:
+        fields = set(req.model_fields_set)
+        backend = _backend(settings)
+        now = int(time.time())
+
+        with backend.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, username, email, role, disabled, token_version, created_at, updated_at, last_login_at, last_login_ip
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="user not found")
+
+            current_username = str(row["username"])
+            current_email = str(row["email"]) if row["email"] is not None else None
+            current_role = str(row["role"] or "user")
+            current_disabled = int(row["disabled"] or 0)
+
+            new_username = current_username
+            new_email = current_email
+            new_role = current_role
+            new_disabled = current_disabled
+
+            if "username" in fields:
+                if req.username is None:
+                    raise HTTPException(status_code=400, detail="invalid username")
+                u = normalize_username(req.username)
+                if len(u) < 3:
+                    raise HTTPException(status_code=400, detail="username too short")
+                if u != current_username and conn.execute(
+                    "SELECT 1 FROM users WHERE username = ? AND id != ? LIMIT 1",
+                    (u, user_id),
+                ).fetchone():
+                    raise HTTPException(status_code=409, detail="username already exists")
+                new_username = u
+
+            if "email" in fields:
+                if req.email is None:
+                    new_email = None
+                else:
+                    try:
+                        e = validate_email(req.email)
+                    except ValueError:
+                        raise HTTPException(status_code=400, detail="invalid email")
+                    if e != current_email and conn.execute(
+                        "SELECT 1 FROM users WHERE email = ? AND id != ? LIMIT 1",
+                        (e, user_id),
+                    ).fetchone():
+                        raise HTTPException(status_code=409, detail="email already registered")
+                    new_email = e
+
+            if "role" in fields:
+                if req.role is None:
+                    raise HTTPException(status_code=400, detail="invalid role")
+                new_role = req.role
+
+            if "disabled" in fields:
+                if req.disabled is None:
+                    raise HTTPException(status_code=400, detail="invalid disabled")
+                new_disabled = 1 if req.disabled else 0
+
+            if current_role == "admin" and current_disabled == 0 and (new_role != "admin" or new_disabled != 0):
+                if _enabled_admin_count(conn) <= 1:
+                    raise HTTPException(status_code=400, detail="cannot remove last admin")
+
+            updates: list[str] = []
+            args: list[Any] = []
+            if new_username != current_username:
+                updates.append("username = ?")
+                args.append(new_username)
+            if new_email != current_email:
+                updates.append("email = ?")
+                args.append(new_email)
+            if new_role != current_role:
+                updates.append("role = ?")
+                args.append(new_role)
+            if new_disabled != current_disabled:
+                updates.append("disabled = ?")
+                args.append(new_disabled)
+                if current_disabled == 0 and new_disabled != 0:
+                    updates.append("token_version = token_version + 1")
+            if updates:
+                updates.append("updated_at = ?")
+                args.append(now)
+                args.append(user_id)
+                conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", args)
+
+            row2 = conn.execute(
+                """
+                SELECT id, username, email, role, disabled, token_version, created_at, updated_at, last_login_at, last_login_ip
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+        if not row2:
+            raise HTTPException(status_code=404, detail="user not found")
+        return _admin_user_item_from_row(row2)
+
+    @app.post(
+        "/v1/admin/users/{user_id}/set-password",
+        response_model=AdminUserTokenVersionResponse,
+        dependencies=[Depends(_auth_enabled_required), Depends(_admin_required)],
+    )
+    def admin_set_user_password(
+        user_id: str,
+        req: AdminUserSetPasswordRequest,
+        settings: Settings = Depends(_settings_dep),
+    ) -> AdminUserTokenVersionResponse:
+        if len(req.password) < 8:
+            raise HTTPException(status_code=400, detail="password too short")
+        password_hash, password_salt = hash_password(req.password)
+        backend = _backend(settings)
+        now = int(time.time())
+        with backend.connect() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE id = ? LIMIT 1", (user_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="user not found")
+            conn.execute(
+                """
+                UPDATE users
+                SET password_hash = ?, password_salt = ?, token_version = token_version + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                (password_hash, password_salt, now, user_id),
+            )
+            row = conn.execute("SELECT token_version FROM users WHERE id = ? LIMIT 1", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="user not found")
+        return AdminUserTokenVersionResponse(token_version=int(row["token_version"] or 0))
+
+    @app.post(
+        "/v1/admin/users/{user_id}/revoke-tokens",
+        response_model=AdminUserTokenVersionResponse,
+        dependencies=[Depends(_auth_enabled_required), Depends(_admin_required)],
+    )
+    def admin_revoke_user_tokens(user_id: str, settings: Settings = Depends(_settings_dep)) -> AdminUserTokenVersionResponse:
+        backend = _backend(settings)
+        now = int(time.time())
+        with backend.connect() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE id = ? LIMIT 1", (user_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="user not found")
+            conn.execute(
+                "UPDATE users SET token_version = token_version + 1, updated_at = ? WHERE id = ?",
+                (now, user_id),
+            )
+            row = conn.execute("SELECT token_version FROM users WHERE id = ? LIMIT 1", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="user not found")
+        return AdminUserTokenVersionResponse(token_version=int(row["token_version"] or 0))
 
     @app.get(
         "/v1/admin/logs/backend",
