@@ -46,8 +46,6 @@ class SqliteBackend:
                   pinyin_full TEXT,
                   updated_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_stock_basic_pinyin_initials ON stock_basic (pinyin_initials);
-                CREATE INDEX IF NOT EXISTS idx_stock_basic_pinyin_full ON stock_basic (pinyin_full);
 
                 CREATE TABLE IF NOT EXISTS provider_stock_progress (
                   provider TEXT NOT NULL,
