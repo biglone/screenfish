@@ -539,7 +539,12 @@ class _UpdateWaitJob:
 
 
 def _backend(settings: Settings) -> SqliteBackend:
-    return SqliteBackend(settings.sqlite_path)
+    return SqliteBackend(
+        settings.sqlite_path,
+        daily_table=settings.daily_table,
+        update_log_table=settings.update_log_table,
+        provider_stock_progress_table=settings.provider_stock_progress_table,
+    )
 
 
 class _StripPrefixMiddleware:
@@ -563,7 +568,7 @@ class _StripPrefixMiddleware:
 def create_app(*, settings: Settings) -> FastAPI:
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
-        backend = SqliteBackend(settings.sqlite_path)
+        backend = _backend(settings)
         backend.init()
 
         prewarm_pinyin_env = os.environ.get("STOCK_SCREENER_PREWARM_PINYIN", "1").strip().lower()
@@ -669,16 +674,22 @@ def create_app(*, settings: Settings) -> FastAPI:
         def _local_ready(trade_date: str) -> tuple[bool, str | None]:
             backend = _backend(settings)
             with backend.connect() as conn:
-                row = conn.execute("SELECT MAX(trade_date) AS d FROM daily").fetchone()
+                row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {backend.daily_table}").fetchone()
                 latest = row["d"] if row else None
-                has_rows = conn.execute(
-                    "SELECT 1 FROM daily WHERE trade_date = ? LIMIT 1",
-                    (trade_date,),
-                ).fetchone() is not None
-                marked = conn.execute(
-                    "SELECT 1 FROM update_log WHERE trade_date = ? LIMIT 1",
-                    (trade_date,),
-                ).fetchone() is not None
+                has_rows = (
+                    conn.execute(
+                        f"SELECT 1 FROM {backend.daily_table} WHERE trade_date = ? LIMIT 1",
+                        (trade_date,),
+                    ).fetchone()
+                    is not None
+                )
+                marked = (
+                    conn.execute(
+                        f"SELECT 1 FROM {backend.update_log_table} WHERE trade_date = ? LIMIT 1",
+                        (trade_date,),
+                    ).fetchone()
+                    is not None
+                )
             return bool(has_rows and marked), (str(latest) if latest is not None else None)
 
         while True:
@@ -1646,13 +1657,13 @@ def create_app(*, settings: Settings) -> FastAPI:
     def status(settings: Settings = Depends(_settings_dep)) -> StatusResponse:
         backend = _backend(settings)
         with backend.connect() as conn:
-            row = conn.execute("SELECT MAX(trade_date) AS d FROM daily").fetchone()
+            row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {backend.daily_table}").fetchone()
             max_daily = row["d"] if row else None
-            row = conn.execute("SELECT MAX(trade_date) AS d FROM update_log").fetchone()
+            row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {backend.update_log_table}").fetchone()
             max_log = row["d"] if row else None
-            row = conn.execute("SELECT COUNT(*) AS n FROM daily").fetchone()
+            row = conn.execute(f"SELECT COUNT(*) AS n FROM {backend.daily_table}").fetchone()
             total_rows = int(row["n"]) if row else 0
-            row = conn.execute("SELECT COUNT(DISTINCT ts_code) AS n FROM daily").fetchone()
+            row = conn.execute(f"SELECT COUNT(DISTINCT ts_code) AS n FROM {backend.daily_table}").fetchone()
             total_stocks = int(row["n"]) if row else 0
         return StatusResponse(
             today=format_yyyymmdd(_date.today()),
@@ -1908,6 +1919,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         backend = _backend(settings)
         with backend.connect() as conn:
             cur = conn.cursor()
+            daily_table = backend.daily_table
             search_raw = (search or "").strip()
             # Prefer stock_basic for listing/search; scanning DISTINCT over daily is expensive.
             cur.execute("SELECT 1 FROM stock_basic LIMIT 1")
@@ -1915,10 +1927,10 @@ def create_app(*, settings: Settings) -> FastAPI:
             if not search_raw:
                 if has_stock_basic:
                     cur.execute(
-                        """
+                        f"""
                         SELECT sb.ts_code, sb.name
                         FROM stock_basic sb
-                        WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                        WHERE EXISTS (SELECT 1 FROM {daily_table} d WHERE d.ts_code = sb.ts_code)
                         ORDER BY sb.ts_code
                         LIMIT ? OFFSET ?
                         """,
@@ -1926,18 +1938,18 @@ def create_app(*, settings: Settings) -> FastAPI:
                     )
                     stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
                     cur.execute(
-                        """
+                        f"""
                         SELECT COUNT(*) as cnt
                         FROM stock_basic sb
-                        WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                        WHERE EXISTS (SELECT 1 FROM {daily_table} d WHERE d.ts_code = sb.ts_code)
                         """
                     )
                     total = cur.fetchone()["cnt"]
                 else:
                     cur.execute(
-                        """
+                        f"""
                         SELECT DISTINCT d.ts_code, sb.name
-                        FROM daily d
+                        FROM {daily_table} d
                         LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
                         ORDER BY d.ts_code
                         LIMIT ? OFFSET ?
@@ -1945,7 +1957,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                         (limit, offset),
                     )
                     stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
-                    cur.execute("SELECT COUNT(DISTINCT ts_code) as cnt FROM daily")
+                    cur.execute(f"SELECT COUNT(DISTINCT ts_code) as cnt FROM {daily_table}")
                     total = cur.fetchone()["cnt"]
             else:
                 # Pinyin initials search (e.g. "zsyh") for Chinese stock names.
@@ -1958,10 +1970,10 @@ def create_app(*, settings: Settings) -> FastAPI:
                         pinyin_like = f"{search_key}%"
                         try:
                             cur.execute(
-                                """
+                                f"""
                                 SELECT sb.ts_code, sb.name
                                 FROM stock_basic sb
-                                WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                                WHERE EXISTS (SELECT 1 FROM {daily_table} d WHERE d.ts_code = sb.ts_code)
                                   AND (
                                     LOWER(sb.ts_code) LIKE ?
                                     OR sb.pinyin_initials LIKE ?
@@ -1974,10 +1986,10 @@ def create_app(*, settings: Settings) -> FastAPI:
                             )
                             stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
                             cur.execute(
-                                """
+                                f"""
                                 SELECT COUNT(*) as cnt
                                 FROM stock_basic sb
-                                WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                                WHERE EXISTS (SELECT 1 FROM {daily_table} d WHERE d.ts_code = sb.ts_code)
                                   AND (
                                     LOWER(sb.ts_code) LIKE ?
                                     OR sb.pinyin_initials LIKE ?
@@ -1991,18 +2003,18 @@ def create_app(*, settings: Settings) -> FastAPI:
                         except sqlite3.OperationalError:
                             # Fallback for legacy DB schema without pinyin cache columns.
                             cur.execute(
-                                """
+                                f"""
                                 SELECT sb.ts_code, sb.name
                                 FROM stock_basic sb
-                                WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                                WHERE EXISTS (SELECT 1 FROM {daily_table} d WHERE d.ts_code = sb.ts_code)
                                 ORDER BY sb.ts_code
                                 """
                             )
                     else:
                         cur.execute(
-                            """
+                            f"""
                             SELECT DISTINCT d.ts_code, sb.name
-                            FROM daily d
+                            FROM {daily_table} d
                             LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
                             ORDER BY d.ts_code
                             """
@@ -2028,10 +2040,10 @@ def create_app(*, settings: Settings) -> FastAPI:
                     search_pattern = f"%{search_raw}%"
                     if has_stock_basic:
                         cur.execute(
-                            """
+                            f"""
                             SELECT sb.ts_code, sb.name
                             FROM stock_basic sb
-                            WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                            WHERE EXISTS (SELECT 1 FROM {daily_table} d WHERE d.ts_code = sb.ts_code)
                               AND (sb.ts_code LIKE ? OR sb.name LIKE ?)
                             ORDER BY sb.ts_code
                             LIMIT ? OFFSET ?
@@ -2040,10 +2052,10 @@ def create_app(*, settings: Settings) -> FastAPI:
                         )
                         stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
                         cur.execute(
-                            """
+                            f"""
                             SELECT COUNT(*) as cnt
                             FROM stock_basic sb
-                            WHERE EXISTS (SELECT 1 FROM daily d WHERE d.ts_code = sb.ts_code)
+                            WHERE EXISTS (SELECT 1 FROM {daily_table} d WHERE d.ts_code = sb.ts_code)
                               AND (sb.ts_code LIKE ? OR sb.name LIKE ?)
                             """,
                             (search_pattern, search_pattern),
@@ -2051,9 +2063,9 @@ def create_app(*, settings: Settings) -> FastAPI:
                         total = cur.fetchone()["cnt"]
                     else:
                         cur.execute(
-                            """
+                            f"""
                             SELECT DISTINCT d.ts_code, sb.name
-                            FROM daily d
+                            FROM {daily_table} d
                             LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
                             WHERE d.ts_code LIKE ? OR sb.name LIKE ?
                             ORDER BY d.ts_code
@@ -2063,9 +2075,9 @@ def create_app(*, settings: Settings) -> FastAPI:
                         )
                         stocks = [StockItem(ts_code=row["ts_code"], name=row["name"]) for row in cur.fetchall()]
                         cur.execute(
-                            """
+                            f"""
                             SELECT COUNT(DISTINCT d.ts_code) as cnt
-                            FROM daily d
+                            FROM {daily_table} d
                             LEFT JOIN stock_basic sb ON d.ts_code = sb.ts_code
                             WHERE d.ts_code LIKE ? OR sb.name LIKE ?
                             """,
@@ -2106,7 +2118,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             name = name_row["name"] if name_row else None
 
             # Build query for daily bars
-            query = """
+            query = f"""
             SELECT
                 trade_date,
                 open,
@@ -2115,7 +2127,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                 close,
                 COALESCE(vol, 0) as vol,
                 COALESCE(amount, 0) as amount
-            FROM daily
+            FROM {backend.daily_table}
             WHERE ts_code = ?
               AND open IS NOT NULL
               AND high IS NOT NULL
@@ -2373,7 +2385,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
             placeholders = ",".join(["?"] * len(ts_codes))
             valid_rows = conn.execute(
-                f"SELECT DISTINCT ts_code FROM daily WHERE ts_code IN ({placeholders})",
+                f"SELECT DISTINCT ts_code FROM {backend.daily_table} WHERE ts_code IN ({placeholders})",
                 ts_codes,
             ).fetchall()
             valid_ts_codes = {str(r["ts_code"]) for r in valid_rows}
@@ -2627,7 +2639,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             raise HTTPException(status_code=400, detail=f"Invalid indicator timeframe: {timeframe}")
 
         with backend.connect() as conn:
-            query = """
+            query = f"""
             SELECT
                 trade_date,
                 open,
@@ -2636,7 +2648,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                 close,
                 COALESCE(vol, 0) as vol,
                 COALESCE(amount, 0) as amount
-            FROM daily
+            FROM {backend.daily_table}
             WHERE ts_code = ?
               AND open IS NOT NULL
               AND high IS NOT NULL
@@ -2741,6 +2753,7 @@ def create_app_from_env() -> FastAPI:
     Env:
       - STOCK_SCREENER_CACHE_DIR: default ./data
       - STOCK_SCREENER_DATA_BACKEND: default sqlite
+      - STOCK_SCREENER_PRICE_ADJUST: none|qfq|hfq (default: none)
       - STOCK_SCREENER_API_KEY: optional (require X-API-Key)
       - STOCK_SCREENER_AUTH_ENABLED: optional (require Authorization: Bearer ... for /v1/*)
       - STOCK_SCREENER_AUTH_SECRET: required when auth enabled
@@ -2759,5 +2772,6 @@ def create_app_from_env() -> FastAPI:
 
     cache_dir = os.environ.get("STOCK_SCREENER_CACHE_DIR", "./data")
     data_backend = os.environ.get("STOCK_SCREENER_DATA_BACKEND", "sqlite")
-    settings = Settings(cache_dir=cache_dir, data_backend=data_backend)  # type: ignore[arg-type]
+    price_adjust = os.environ.get("STOCK_SCREENER_PRICE_ADJUST", "none")
+    settings = Settings(cache_dir=cache_dir, data_backend=data_backend, price_adjust=price_adjust)  # type: ignore[arg-type]
     return create_app(settings=settings)

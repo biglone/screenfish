@@ -43,6 +43,26 @@ export TUSHARE_TOKEN="你的token"
 - 日线表 `daily`：`ts_code + trade_date` 唯一去重。
 - 更新日志表 `update_log`：按交易日记录是否已成功写入（用于增量更新）。
 
+## 复权口径（与通达信一致性）
+
+通达信常用的“前复权（QFQ）”会对历史价格做复权处理，指标/筛选结果会与“不复权”产生差异。
+
+本项目支持 3 种口径（影响 `open/high/low/close`）：
+- `none`：不复权（默认；BaoStock `adjustflag=3`）
+- `qfq`：前复权（BaoStock `adjustflag=2`）
+- `hfq`：后复权（BaoStock `adjustflag=1`）
+
+配置方式：
+- **API/Docker**：设置环境变量 `STOCK_SCREENER_PRICE_ADJUST=none|qfq|hfq`
+- **CLI**：使用 `--price-adjust none|qfq|hfq`
+
+同一个 `daily.sqlite3` 内会分别存储不同口径的数据：
+- 日线表：`daily` / `daily_qfq` / `daily_hfq`
+- 更新日志：`update_log` / `update_log_qfq` / `update_log_hfq`
+- 更新进度：`provider_stock_progress` / `provider_stock_progress_qfq` / `provider_stock_progress_hfq`
+
+切换口径后需要先跑一次 `update`（对应口径的表是空的）。
+
 ## 更新数据
 
 ```bash

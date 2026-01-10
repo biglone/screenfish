@@ -24,8 +24,9 @@ def update(
     repair_days: int = typer.Option(30, help="Auto mode lookback calendar days to repair gaps"),
     data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
+    price_adjust: str = typer.Option("none", help="Price adjust mode: none|qfq|hfq"),
 ) -> None:
-    settings = Settings(cache_dir=cache, data_backend=data_backend)
+    settings = Settings(cache_dir=cache, data_backend=data_backend, price_adjust=price_adjust)
     update_daily(settings=settings, start=start, end=end, provider=provider, repair_days=repair_days)
 
 
@@ -35,8 +36,9 @@ def sync_names_cmd(
     provider: str = typer.Option("baostock", help="baostock|tushare"),
     data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
+    price_adjust: str = typer.Option("none", help="Price adjust mode: none|qfq|hfq"),
 ) -> None:
-    settings = Settings(cache_dir=cache, data_backend=data_backend)
+    settings = Settings(cache_dir=cache, data_backend=data_backend, price_adjust=price_adjust)
     sync_names(settings=settings, provider=provider, date=date)
 
 
@@ -50,8 +52,9 @@ def run(
     lookback_days: int = typer.Option(200, help="Calendar days lookback to compute indicators"),
     rules: Optional[str] = typer.Option(None, help="Comma-separated rule names (default: built-in)"),
     with_name: bool = typer.Option(False, help="Include stock name (requires local stock_basic cache)"),
+    price_adjust: str = typer.Option("none", help="Price adjust mode: none|qfq|hfq"),
 ) -> None:
-    settings = Settings(cache_dir=cache, data_backend=data_backend)
+    settings = Settings(cache_dir=cache, data_backend=data_backend, price_adjust=price_adjust)
     results = run_screen(
         settings=settings,
         date=date,
@@ -80,10 +83,11 @@ def export_ebk_cmd(
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
     lookback_days: int = typer.Option(200, help="Calendar days lookback to compute indicators"),
     rules: Optional[str] = typer.Option(None, help="Comma-separated rule names (default: built-in)"),
+    price_adjust: str = typer.Option("none", help="Price adjust mode: none|qfq|hfq"),
 ) -> None:
     if out.suffix.lower() != ".ebk":
         raise typer.BadParameter("out must end with .EBK")
-    settings = Settings(cache_dir=cache, data_backend=data_backend)
+    settings = Settings(cache_dir=cache, data_backend=data_backend, price_adjust=price_adjust)
     results = run_screen(settings=settings, date=date, combo=combo, lookback_days=lookback_days, rules=rules)
     out.parent.mkdir(parents=True, exist_ok=True)
     write_ebk(results["ts_code"].astype(str).tolist(), out)
@@ -93,8 +97,9 @@ def serve(
     port: int = typer.Option(8000, help="Bind port"),
     data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
+    price_adjust: str = typer.Option("none", help="Price adjust mode: none|qfq|hfq"),
 ) -> None:
-    settings = Settings(cache_dir=cache, data_backend=data_backend)
+    settings = Settings(cache_dir=cache, data_backend=data_backend, price_adjust=price_adjust)
     import uvicorn
 
     uvicorn.run(create_app(settings=settings), host=host, port=port)

@@ -13,6 +13,9 @@ import pandas as pd
 @dataclass(frozen=True)
 class SqliteBackend:
     path: Path
+    daily_table: str = "daily"
+    update_log_table: str = "update_log"
+    provider_stock_progress_table: str = "provider_stock_progress"
 
     def init(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,7 +37,43 @@ class SqliteBackend:
                 );
                 CREATE INDEX IF NOT EXISTS idx_daily_trade_date ON daily (trade_date);
 
+                CREATE TABLE IF NOT EXISTS daily_qfq (
+                  ts_code TEXT NOT NULL,
+                  trade_date TEXT NOT NULL,
+                  open REAL,
+                  high REAL,
+                  low REAL,
+                  close REAL,
+                  vol REAL,
+                  amount REAL,
+                  PRIMARY KEY (ts_code, trade_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_qfq_trade_date ON daily_qfq (trade_date);
+
+                CREATE TABLE IF NOT EXISTS daily_hfq (
+                  ts_code TEXT NOT NULL,
+                  trade_date TEXT NOT NULL,
+                  open REAL,
+                  high REAL,
+                  low REAL,
+                  close REAL,
+                  vol REAL,
+                  amount REAL,
+                  PRIMARY KEY (ts_code, trade_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_hfq_trade_date ON daily_hfq (trade_date);
+
                 CREATE TABLE IF NOT EXISTS update_log (
+                  trade_date TEXT PRIMARY KEY,
+                  updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS update_log_qfq (
+                  trade_date TEXT PRIMARY KEY,
+                  updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS update_log_hfq (
                   trade_date TEXT PRIMARY KEY,
                   updated_at TEXT NOT NULL
                 );
@@ -48,6 +87,24 @@ class SqliteBackend:
                 );
 
                 CREATE TABLE IF NOT EXISTS provider_stock_progress (
+                  provider TEXT NOT NULL,
+                  range_start TEXT NOT NULL,
+                  range_end TEXT NOT NULL,
+                  ts_code TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (provider, range_start, range_end, ts_code)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_stock_progress_qfq (
+                  provider TEXT NOT NULL,
+                  range_start TEXT NOT NULL,
+                  range_end TEXT NOT NULL,
+                  ts_code TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (provider, range_start, range_end, ts_code)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_stock_progress_hfq (
                   provider TEXT NOT NULL,
                   range_start TEXT NOT NULL,
                   range_end TEXT NOT NULL,
@@ -244,7 +301,7 @@ class SqliteBackend:
         if not trade_dates:
             return set()
         placeholders = ",".join(["?"] * len(trade_dates))
-        query = f"SELECT trade_date FROM update_log WHERE trade_date IN ({placeholders})"
+        query = f"SELECT trade_date FROM {self.update_log_table} WHERE trade_date IN ({placeholders})"
         with self.connect() as conn:
             rows = conn.execute(query, list(trade_dates)).fetchall()
         return {row["trade_date"] for row in rows}
@@ -256,7 +313,7 @@ class SqliteBackend:
     def mark_trade_date_updated_in_conn(self, conn: sqlite3.Connection, trade_date: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            "INSERT OR REPLACE INTO update_log (trade_date, updated_at) VALUES (?, ?)",
+            f"INSERT OR REPLACE INTO {self.update_log_table} (trade_date, updated_at) VALUES (?, ?)",
             (trade_date, now),
         )
 
@@ -266,8 +323,8 @@ class SqliteBackend:
 
     def upsert_daily_rows_in_conn(self, conn: sqlite3.Connection, rows: Iterable[tuple]) -> None:
         conn.executemany(
-            """
-            INSERT OR REPLACE INTO daily
+            f"""
+            INSERT OR REPLACE INTO {self.daily_table}
               (ts_code, trade_date, open, high, low, close, vol, amount)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -297,9 +354,9 @@ class SqliteBackend:
     def load_daily_between(self, start: str, end: str) -> pd.DataFrame:
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT ts_code, trade_date, open, high, low, close, vol, amount
-                FROM daily
+                FROM {self.daily_table}
                 WHERE trade_date >= ? AND trade_date <= ?
                 ORDER BY ts_code ASC, trade_date ASC
                 """,
@@ -310,9 +367,9 @@ class SqliteBackend:
     def load_daily_lookback(self, end: str, start: str) -> pd.DataFrame:
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT ts_code, trade_date, open, high, low, close, vol, amount
-                FROM daily
+                FROM {self.daily_table}
                 WHERE trade_date >= ? AND trade_date <= ?
                 ORDER BY ts_code ASC, trade_date ASC
                 """,
@@ -323,9 +380,9 @@ class SqliteBackend:
     def get_progress_ts_codes(self, *, provider: str, range_start: str, range_end: str) -> set[str]:
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT ts_code
-                FROM provider_stock_progress
+                FROM {self.provider_stock_progress_table}
                 WHERE provider = ? AND range_start = ? AND range_end = ?
                 """,
                 (provider, range_start, range_end),
@@ -391,27 +448,30 @@ class SqliteBackend:
 
     def max_trade_date_in_daily(self) -> str | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT MAX(trade_date) AS d FROM daily").fetchone()
+            row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {self.daily_table}").fetchone()
         if not row:
             return None
         return row["d"]
 
     def max_trade_date_in_update_log(self) -> str | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT MAX(trade_date) AS d FROM update_log").fetchone()
+            row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {self.update_log_table}").fetchone()
         if not row:
             return None
         return row["d"]
 
     def count_daily_rows_for_trade_date(self, trade_date: str) -> int:
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS n FROM daily WHERE trade_date = ?", (trade_date,)).fetchone()
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM {self.daily_table} WHERE trade_date = ?",
+                (trade_date,),
+            ).fetchone()
         return int(row["n"]) if row else 0
 
     def clear_progress(self, *, provider: str, range_start: str, range_end: str) -> None:
         with self.connect() as conn:
             conn.execute(
-                "DELETE FROM provider_stock_progress WHERE provider = ? AND range_start = ? AND range_end = ?",
+                f"DELETE FROM {self.provider_stock_progress_table} WHERE provider = ? AND range_start = ? AND range_end = ?",
                 (provider, range_start, range_end),
             )
 
@@ -426,8 +486,8 @@ class SqliteBackend:
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            """
-            INSERT OR REPLACE INTO provider_stock_progress
+            f"""
+            INSERT OR REPLACE INTO {self.provider_stock_progress_table}
               (provider, range_start, range_end, ts_code, updated_at)
             VALUES (?, ?, ?, ?, ?)
             """,
@@ -437,9 +497,9 @@ class SqliteBackend:
     def distinct_ts_codes_in_range(self, *, start: str, end: str) -> set[str]:
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT ts_code
-                FROM daily
+                FROM {self.daily_table}
                 WHERE trade_date >= ? AND trade_date <= ?
                 """,
                 (start, end),

@@ -36,6 +36,7 @@ def bs_to_ts_code(bs_code: str) -> str:
 @dataclass(frozen=True)
 class BaoStockProvider:
     name: str = "baostock"
+    adjustflag: str = "3"
 
     def _bs(self):
         try:
@@ -152,7 +153,7 @@ class BaoStockProvider:
                     start_date=_to_iso(start),
                     end_date=_to_iso(end),
                     frequency="d",
-                    adjustflag="3",
+                    adjustflag=str(self.adjustflag or "3"),
                 )
                 if rs is None:  # pragma: no cover
                     last_err = "baostock returned None resultset"

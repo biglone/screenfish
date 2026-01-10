@@ -78,12 +78,21 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
     if settings.data_backend != "sqlite":
         raise UpdateBadRequest("only sqlite backend is implemented")
 
-    backend = SqliteBackend(settings.sqlite_path)
+    backend = SqliteBackend(
+        settings.sqlite_path,
+        daily_table=settings.daily_table,
+        update_log_table=settings.update_log_table,
+        provider_stock_progress_table=settings.provider_stock_progress_table,
+    )
     backend.init()
     start_eff, end_eff = _resolve_start_end(backend=backend, start=start, end=end, repair_days=repair_days)
 
     try:
-        p = get_provider(provider)
+        provider_norm = (provider or "").strip().lower()
+        if provider_norm == "baostock":
+            p = get_provider(provider_norm, baostock_adjustflag=settings.baostock_adjustflag)
+        else:
+            p = get_provider(provider_norm)
         open_dates = p.open_trade_dates(start=start_eff, end=end_eff)
     except (TuShareNotConfigured, BaoStockNotConfigured) as e:
         raise UpdateNotConfigured(str(e)) from e

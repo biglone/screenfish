@@ -40,7 +40,12 @@ def run_screen(
         raise typer.BadParameter("combo must be 'and' or 'or'")
     parse_yyyymmdd(date)
 
-    backend = SqliteBackend(settings.sqlite_path)
+    backend = SqliteBackend(
+        settings.sqlite_path,
+        daily_table=settings.daily_table,
+        update_log_table=settings.update_log_table,
+        provider_stock_progress_table=settings.provider_stock_progress_table,
+    )
     backend.init()
 
     start = subtract_calendar_days(date, lookback_days)
