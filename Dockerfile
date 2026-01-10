@@ -8,7 +8,8 @@ WORKDIR /app
 COPY pyproject.toml README.md /app/
 COPY src /app/src
 
-RUN pip install -U pip && pip install -e ".[dev]"
+RUN pip install --no-cache-dir -U pip \
+    && pip install --no-cache-dir .
 
 ENV STOCK_SCREENER_CACHE_DIR=/data \
     STOCK_SCREENER_DATA_BACKEND=sqlite
@@ -16,4 +17,3 @@ ENV STOCK_SCREENER_CACHE_DIR=/data \
 EXPOSE 8000
 
 CMD ["python", "-m", "uvicorn", "stock_screener.server:create_app_from_env", "--factory", "--host", "0.0.0.0", "--port", "8000"]
-

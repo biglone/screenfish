@@ -153,6 +153,32 @@ Linux（systemd）可直接使用定时器示例（每日更新一次）：
 - 复制 `deploy/systemd/stock_screener-update.service` 与 `deploy/systemd/stock_screener-update.timer` 到 `/etc/systemd/system/`
 - 启用：`sudo systemctl daemon-reload && sudo systemctl enable --now stock_screener-update.timer`
 
+## Docker 一键启动（后端 + Web）
+
+在本目录下启动（会同时启动后端 API 与 Web UI，并将 `./data` 挂载到容器 `/data` 作为持久化缓存）：
+
+```bash
+docker compose up -d --build
+```
+
+配置（可选）：复制 `./.env.example` 为 `./.env`，按需设置端口、`TUSHARE_TOKEN`、鉴权等。
+
+访问：
+- Web UI：`http://127.0.0.1:5174`
+- 后端 API：`http://127.0.0.1:8000/v1`（Web 同源访问用 `/api/v1`）
+
+停止：
+
+```bash
+docker compose down
+```
+
+如端口冲突，可临时指定：
+
+```bash
+SCREENFISH_WEB_PORT=15174 SCREENFISH_BACKEND_PORT=18000 docker compose up -d --build
+```
+
 ## 后台服务（REST API）
 
 提供一个常驻后台服务，便于你判断“当日日线是否可拉取”、轮询拉取并在数据到位后执行筛选。

@@ -5,6 +5,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+.env
+.env.docker
 data/
 *.sqlite3
 *.db

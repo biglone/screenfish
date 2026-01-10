@@ -3,16 +3,82 @@ services:
     build: .
     container_name: stock_screener
     restart: unless-stopped
+    user: "${SCREENFISH_UID:-1000}:${SCREENFISH_GID:-1000}"
     environment:
       STOCK_SCREENER_CACHE_DIR: /data
       STOCK_SCREENER_DATA_BACKEND: sqlite
-      # STOCK_SCREENER_API_KEY: "change-me"
-      # STOCK_SCREENER_CORS_ORIGINS: "https://your-domain.com,https://app.your-domain.com"
-      # TUSHARE_TOKEN: ""
+      STOCK_SCREENER_API_KEY: ${STOCK_SCREENER_API_KEY:-}
+      STOCK_SCREENER_CORS_ORIGINS: ${STOCK_SCREENER_CORS_ORIGINS:-}
+      STOCK_SCREENER_AUTH_ENABLED: ${STOCK_SCREENER_AUTH_ENABLED:-}
+      STOCK_SCREENER_AUTH_SECRET: ${STOCK_SCREENER_AUTH_SECRET:-}
+      STOCK_SCREENER_AUTH_SIGNUP_MODE: ${STOCK_SCREENER_AUTH_SIGNUP_MODE:-}
+      STOCK_SCREENER_AUTH_ALLOWED_EMAIL_DOMAINS: ${STOCK_SCREENER_AUTH_ALLOWED_EMAIL_DOMAINS:-}
+      STOCK_SCREENER_AUTH_TOKEN_TTL_SECONDS: ${STOCK_SCREENER_AUTH_TOKEN_TTL_SECONDS:-}
+      STOCK_SCREENER_AUTH_EMAIL_CODE_TTL_SECONDS: ${STOCK_SCREENER_AUTH_EMAIL_CODE_TTL_SECONDS:-}
+      STOCK_SCREENER_AUTH_EMAIL_CODE_COOLDOWN_SECONDS: ${STOCK_SCREENER_AUTH_EMAIL_CODE_COOLDOWN_SECONDS:-}
+      STOCK_SCREENER_AUTH_EMAIL_CODE_MAX_ATTEMPTS: ${STOCK_SCREENER_AUTH_EMAIL_CODE_MAX_ATTEMPTS:-}
+      STOCK_SCREENER_AUTH_EMAIL_DEBUG_RETURN_CODE: ${STOCK_SCREENER_AUTH_EMAIL_DEBUG_RETURN_CODE:-}
+      STOCK_SCREENER_SMTP_HOST: ${STOCK_SCREENER_SMTP_HOST:-}
+      STOCK_SCREENER_SMTP_PORT: ${STOCK_SCREENER_SMTP_PORT:-}
+      STOCK_SCREENER_SMTP_USERNAME: ${STOCK_SCREENER_SMTP_USERNAME:-}
+      STOCK_SCREENER_SMTP_PASSWORD: ${STOCK_SCREENER_SMTP_PASSWORD:-}
+      STOCK_SCREENER_SMTP_FROM: ${STOCK_SCREENER_SMTP_FROM:-}
+      STOCK_SCREENER_SMTP_TLS: ${STOCK_SCREENER_SMTP_TLS:-}
+      STOCK_SCREENER_SMTP_SSL: ${STOCK_SCREENER_SMTP_SSL:-}
+      STOCK_SCREENER_ENABLE_LOGS_API: ${STOCK_SCREENER_ENABLE_LOGS_API:-}
+      STOCK_SCREENER_ADMIN_TOKEN: ${STOCK_SCREENER_ADMIN_TOKEN:-}
+      STOCK_SCREENER_LOG_UNIT: ${STOCK_SCREENER_LOG_UNIT:-}
+      STOCK_SCREENER_LOG_FILE: ${STOCK_SCREENER_LOG_FILE:-/data/backend.log}
+      STOCK_SCREENER_PREWARM_PINYIN: ${STOCK_SCREENER_PREWARM_PINYIN:-}
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+    command:
+      [
+        "sh",
+        "-c",
+        "python -m uvicorn stock_screener.server:create_app_from_env --factory --host 0.0.0.0 --port 8000 2>&1 | tee -a /data/backend.log",
+      ]
     volumes:
       - ./data:/data
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${SCREENFISH_BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; url='http://127.0.0.1:8000/v1/health'; req=urllib.request.Request(url); k=(os.environ.get('STOCK_SCREENER_API_KEY') or '').strip(); req.add_header('X-API-Key', k) if k else None; urllib.request.urlopen(req, timeout=2).read()",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  screenfish_web:
+    build:
+      context: ../screenfish-web
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
+        VITE_API_KEY: ${VITE_API_KEY:-}
+    container_name: screenfish_web
+    restart: unless-stopped
+    depends_on:
+      stock_screener:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${SCREENFISH_WEB_PORT:-5174}:80"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1/', timeout=2).read()",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
 
   # Optional: expose via Cloudflare Tunnel without opening firewall ports.
   # cloudflared:
@@ -24,4 +90,3 @@ services:
   #   command: tunnel run --token ${CLOUDFLARED_TOKEN}
   #   environment:
   #     CLOUDFLARED_TOKEN: ""
-
