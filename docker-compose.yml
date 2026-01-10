@@ -8,6 +8,9 @@ services:
       STOCK_SCREENER_CACHE_DIR: /data
       STOCK_SCREENER_DATA_BACKEND: sqlite
       STOCK_SCREENER_API_KEY: ${STOCK_SCREENER_API_KEY:-}
+      STOCK_SCREENER_GIT_SHA: ${STOCK_SCREENER_GIT_SHA:-}
+      STOCK_SCREENER_GIT_DESCRIBE: ${STOCK_SCREENER_GIT_DESCRIBE:-}
+      STOCK_SCREENER_BUILD_TIME: ${STOCK_SCREENER_BUILD_TIME:-}
       STOCK_SCREENER_CORS_ORIGINS: ${STOCK_SCREENER_CORS_ORIGINS:-}
       STOCK_SCREENER_AUTH_ENABLED: ${STOCK_SCREENER_AUTH_ENABLED:-}
       STOCK_SCREENER_AUTH_SECRET: ${STOCK_SCREENER_AUTH_SECRET:-}
@@ -38,7 +41,7 @@ services:
         "python -m uvicorn stock_screener.server:create_app_from_env --factory --host 0.0.0.0 --port 8000 2>&1 | tee -a /data/backend.log",
       ]
     volumes:
-      - ./data:/data
+      - ${SCREENFISH_DATA_DIR:-./data}:/data
     ports:
       - "127.0.0.1:${SCREENFISH_BACKEND_PORT:-8000}:8000"
     healthcheck:
@@ -56,10 +59,13 @@ services:
 
   screenfish_web:
     build:
-      context: ../screenfish-web
+      context: ${SCREENFISH_WEB_CONTEXT:-../screenfish-web}
       args:
         VITE_API_URL: ${VITE_API_URL:-/api}
         VITE_API_KEY: ${VITE_API_KEY:-}
+        VITE_APP_VERSION: ${VITE_APP_VERSION:-}
+        VITE_BUILD_SHA: ${VITE_BUILD_SHA:-}
+        VITE_BUILD_TIME: ${VITE_BUILD_TIME:-}
     container_name: screenfish_web
     restart: unless-stopped
     depends_on:

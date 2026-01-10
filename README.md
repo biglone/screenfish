@@ -202,6 +202,8 @@ API 文档（OpenAPI）：
 - 请求头：`X-API-Key: your-key`
 
 常用接口（Base URL：`/v1`）：
+- `GET /v1/health`：健康检查（鉴权开启时会返回是否需要初始化）
+- `GET /v1/version`：查看当前后端版本与构建信息
 - `GET /v1/status`：查看本地缓存状态与最新交易日
 - `GET /v1/data/availability?provider=baostock&date=YYYYMMDD`：探测当日日线是否已可取
 - `POST /v1/update`：触发更新（支持 `start/end` 或自动模式）

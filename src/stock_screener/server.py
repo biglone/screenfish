@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
+from stock_screener import __version__ as app_version
 from stock_screener.auth import (
     AuthUser,
     auth_enabled,
@@ -908,6 +909,16 @@ def create_app(*, settings: Settings) -> FastAPI:
             "auth_enabled": app.state.app_state.auth_enabled,
             "auth_signup_mode": app.state.app_state.auth_signup_mode if app.state.app_state.auth_enabled else None,
             "auth_bootstrap": bootstrap if app.state.app_state.auth_enabled else None,
+        }
+
+    @app.get("/v1/version", dependencies=[Depends(_api_key_required_if_auth_disabled)])
+    def version() -> dict[str, Any]:
+        return {
+            "name": "stock-screener",
+            "version": app_version,
+            "git_sha": (os.environ.get("STOCK_SCREENER_GIT_SHA") or "").strip() or None,
+            "git_describe": (os.environ.get("STOCK_SCREENER_GIT_DESCRIBE") or "").strip() or None,
+            "build_time": (os.environ.get("STOCK_SCREENER_BUILD_TIME") or "").strip() or None,
         }
 
     @app.post("/v1/auth/register", response_model=AuthTokenResponse, dependencies=[Depends(_auth_enabled_required)])

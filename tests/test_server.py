@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
+from stock_screener import __version__ as app_version
 from stock_screener.backends.sqlite_backend import SqliteBackend
 from stock_screener.config import Settings
 from stock_screener.server import create_app
@@ -66,6 +67,12 @@ def test_health_and_status(tmp_path: Path) -> None:
     r = client.get("/v1/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+    rv = client.get("/v1/version")
+    assert rv.status_code == 200
+    v = rv.json()
+    assert v["name"] == "stock-screener"
+    assert v["version"] == app_version
 
     r2 = client.get("/v1/status")
     assert r2.status_code == 200
