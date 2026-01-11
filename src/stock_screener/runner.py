@@ -12,6 +12,13 @@ from stock_screener.dates import parse_yyyymmdd, subtract_calendar_days
 from stock_screener.rules import resolve_rules
 
 
+def _is_st_name(name: str | None) -> bool:
+    if not name:
+        return False
+    n = str(name).strip().upper().replace(" ", "")
+    return n.startswith("ST") or n.startswith("*ST") or n.startswith("S*ST") or n.startswith("SST")
+
+
 @dataclass(frozen=True)
 class ScreenResultColumns:
     trade_date: str = "trade_date"
@@ -33,6 +40,7 @@ def run_screen(
     lookback_days: int = 200,
     rules: str | None = None,
     with_name: bool = False,
+    exclude_st: bool = False,
 ) -> pd.DataFrame:
     if settings.data_backend != "sqlite":
         raise typer.BadParameter("only sqlite backend is implemented")
@@ -97,11 +105,20 @@ def run_screen(
     for col in (cols.ma60, cols.mid_bullbear, cols.j):
         _ensure_col(hits, col)
 
+    name_map: dict[str, str | None] | None = None
+    if (with_name or exclude_st) and not hits.empty:
+        name_map = backend.load_stock_names(hits["ts_code"].astype(str).unique().tolist())
+        if exclude_st and name_map:
+            names = hits["ts_code"].astype(str).map(name_map)
+            is_st = names.astype(object).where(names.notna(), None).map(_is_st_name).fillna(False)
+            hits = hits.loc[~is_st].copy()
+
     if with_name:
         base_cols.insert(2, cols.name)
         _ensure_col(hits, cols.name)
         if not hits.empty:
-            name_map = backend.load_stock_names(hits["ts_code"].astype(str).unique().tolist())
+            if name_map is None:
+                name_map = backend.load_stock_names(hits["ts_code"].astype(str).unique().tolist())
             names = hits["ts_code"].astype(str).map(name_map)
             hits[cols.name] = names.astype(object).where(names.notna(), None)
 

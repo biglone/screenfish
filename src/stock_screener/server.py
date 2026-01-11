@@ -266,6 +266,7 @@ class ScreenRequest(BaseModel):
     lookback_days: int = 200
     rules: str | None = None
     with_name: bool = False
+    exclude_st: bool = False
     price_adjust: Literal["none", "qfq", "hfq"] | None = None
 
 
@@ -1848,6 +1849,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                 lookback_days=req.lookback_days,
                 rules=req.rules,
                 with_name=req.with_name,
+                exclude_st=req.exclude_st,
             )
         except typer.BadParameter as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1925,6 +1927,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                 lookback_days=req.lookback_days,
                 rules=req.rules,
                 with_name=False,
+                exclude_st=req.exclude_st,
             )
         except typer.BadParameter as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
