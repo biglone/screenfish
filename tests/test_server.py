@@ -81,6 +81,75 @@ def test_health_and_status(tmp_path: Path) -> None:
     assert body["stocks"] == 1
 
 
+def test_data_integrity_ok(tmp_path: Path, monkeypatch) -> None:
+    import stock_screener.server as srv
+
+    settings = _seed_sqlite_one_day(tmp_path, "20240131")
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    class FakeProvider:
+        def open_trade_dates(self, *, start: str, end: str):  # noqa: ANN001
+            return ["20240131"]
+
+    monkeypatch.setattr(srv, "get_provider", lambda _provider: FakeProvider())
+
+    r = client.get("/v1/data/integrity", params={"provider": "baostock", "date": "20240131", "lookback_days": 5})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["missing_update_log_count"] == 0
+    assert body["missing_daily_count"] == 0
+
+
+def test_data_integrity_detects_missing_update_log(tmp_path: Path, monkeypatch) -> None:
+    import stock_screener.server as srv
+
+    settings = _seed_sqlite_one_day(tmp_path, "20240131")
+    backend = SqliteBackend(settings.sqlite_path)
+    with backend.connect() as conn:
+        conn.execute("DELETE FROM update_log")
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    class FakeProvider:
+        def open_trade_dates(self, *, start: str, end: str):  # noqa: ANN001
+            return ["20240131"]
+
+    monkeypatch.setattr(srv, "get_provider", lambda _provider: FakeProvider())
+
+    r = client.get("/v1/data/integrity", params={"provider": "baostock", "date": "20240131", "lookback_days": 5})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["missing_update_log_count"] == 1
+    assert body["missing_update_log_dates"] == ["20240131"]
+
+
+def test_data_integrity_detects_missing_bj_rows(tmp_path: Path, monkeypatch) -> None:
+    import stock_screener.server as srv
+
+    settings = _seed_sqlite_one_day(tmp_path, "20240131")
+    backend = SqliteBackend(settings.sqlite_path)
+    backend.upsert_stock_basic_df(pd.DataFrame([{"ts_code": "920809.BJ", "name": "安达科技"}]))
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    class FakeProvider:
+        def open_trade_dates(self, *, start: str, end: str):  # noqa: ANN001
+            return ["20240131"]
+
+    monkeypatch.setattr(srv, "get_provider", lambda _provider: FakeProvider())
+
+    r = client.get("/v1/data/integrity", params={"provider": "baostock", "date": "20240131", "lookback_days": 5})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["missing_market_daily_count"]["BJ"] == 1
+
+
 def test_auto_update_config_defaults_and_update(tmp_path: Path) -> None:
     settings = _seed_sqlite(tmp_path)
     app = create_app(settings=settings)

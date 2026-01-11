@@ -6,6 +6,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import statistics
 import subprocess
 import threading
 import time
@@ -284,6 +285,42 @@ class AvailabilityResponse(BaseModel):
     provider: str
     available: bool
     detail: str
+
+
+class DataIntegrityCount(BaseModel):
+    trade_date: str
+    rows: int
+
+
+class DataIntegrityResponse(BaseModel):
+    ok: bool
+    provider: Literal["baostock", "tushare"]
+    price_adjust: Literal["none", "qfq", "hfq"]
+    requested_date: str
+    target_date: str
+    lookback_days: int
+    range_start: str
+    range_end: str
+    open_trade_dates: int
+    max_daily_trade_date: str | None
+    max_update_log_trade_date: str | None
+
+    missing_update_log_count: int
+    missing_update_log_dates: list[str] = Field(default_factory=list)
+
+    missing_daily_count: int
+    missing_daily_dates: list[str] = Field(default_factory=list)
+
+    daily_rows_min: int | None = None
+    daily_rows_median: int | None = None
+    daily_rows_max: int | None = None
+    suspicious_daily_count: int
+    suspicious_daily_dates: list[DataIntegrityCount] = Field(default_factory=list)
+
+    market_stock_basic: dict[str, int] = Field(default_factory=dict)
+    market_daily_rows_on_target_date: dict[str, int] = Field(default_factory=dict)
+    missing_market_daily_count: dict[str, int] = Field(default_factory=dict)
+    missing_market_daily_dates: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class StockItem(BaseModel):
@@ -2061,6 +2098,177 @@ def create_app(*, settings: Settings) -> FastAPI:
             return AvailabilityResponse(date=date, provider=provider, available=False, detail="no sample rows yet")
         finally:
             bs.logout()
+
+    @app.get("/v1/data/integrity", response_model=DataIntegrityResponse, dependencies=[Depends(_access_required)])
+    def data_integrity(
+        provider: Literal["baostock", "tushare"] = Query(default="baostock"),
+        date: str = Query(default="latest", description="latest or YYYYMMDD"),
+        lookback_days: int = Query(default=60, ge=0, le=3650),
+        suspicious_ratio: float = Query(default=0.8, ge=0.0, le=1.0),
+        price_adjust: Literal["none", "qfq", "hfq"] | None = Query(default=None, description="Price adjust mode"),
+        settings: Settings = Depends(_settings_dep),
+    ) -> DataIntegrityResponse:
+        eff_settings = settings
+        if price_adjust is not None:
+            eff_settings = settings.model_copy(update={"price_adjust": price_adjust})
+        backend = _backend(eff_settings)
+
+        max_daily = backend.max_trade_date_in_daily()
+        max_log = backend.max_trade_date_in_update_log()
+
+        requested_date: str
+        if date == "latest":
+            if not max_daily:
+                raise HTTPException(status_code=400, detail="no local data; run update first")
+            requested_date = str(max_daily)
+        else:
+            requested_date = str(date)
+            try:
+                parse_yyyymmdd(requested_date)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+        try:
+            target_date = resolve_wait_target_trade_date(
+                provider=provider,
+                target_date=requested_date,
+                lookback_days=lookback_days,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        range_start = subtract_calendar_days(target_date, lookback_days)
+        try:
+            p = get_provider(provider)
+            open_dates = [str(x) for x in p.open_trade_dates(start=range_start, end=target_date)]
+        except (TuShareNotConfigured, BaoStockNotConfigured, TuShareTokenMissing, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:  # pragma: no cover
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+        updated_dates = backend.get_updated_trade_dates(open_dates)
+        missing_update_log_dates = [d for d in open_dates if d not in updated_dates]
+
+        daily_counts: dict[str, int] = {}
+        market_stock_basic: dict[str, int] = {}
+        market_daily_rows_on_target_date: dict[str, int] = {}
+        missing_market_daily_dates: dict[str, list[str]] = {}
+        missing_market_daily_count: dict[str, int] = {}
+        with backend.connect() as conn:
+            if open_dates:
+                placeholders = ",".join(["?"] * len(open_dates))
+                rows = conn.execute(
+                    f"""
+                    SELECT trade_date, COUNT(*) AS n
+                    FROM {backend.daily_table}
+                    WHERE trade_date IN ({placeholders})
+                    GROUP BY trade_date
+                    """,
+                    list(open_dates),
+                ).fetchall()
+                daily_counts = {str(r["trade_date"]): int(r["n"] or 0) for r in rows}
+
+            markets = {"SH": ".SH", "SZ": ".SZ", "BJ": ".BJ"}
+            for market, suffix in markets.items():
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM stock_basic WHERE ts_code LIKE ?",
+                    (f"%{suffix}",),
+                ).fetchone()
+                stock_basic_n = int(row["n"] or 0) if row else 0
+                market_stock_basic[market] = stock_basic_n
+
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {backend.daily_table} WHERE trade_date = ? AND ts_code LIKE ?",
+                    (target_date, f"%{suffix}"),
+                ).fetchone()
+                market_daily_rows_on_target_date[market] = int(row["n"] or 0) if row else 0
+
+                # Per-market missing trade dates: if we have that market in stock_basic, it should have rows.
+                expected_market = stock_basic_n > 0
+                if market == "BJ" and target_date < "20211115":
+                    expected_market = False
+
+                if not expected_market or not open_dates:
+                    missing_market_daily_dates[market] = []
+                    missing_market_daily_count[market] = 0
+                    continue
+
+                placeholders = ",".join(["?"] * len(open_dates))
+                rows = conn.execute(
+                    f"""
+                    SELECT trade_date, COUNT(*) AS n
+                    FROM {backend.daily_table}
+                    WHERE trade_date IN ({placeholders})
+                      AND ts_code LIKE ?
+                    GROUP BY trade_date
+                    """,
+                    list(open_dates) + [f"%{suffix}"],
+                ).fetchall()
+                market_counts = {str(r["trade_date"]): int(r["n"] or 0) for r in rows}
+                missing_dates = [d for d in open_dates if int(market_counts.get(d, 0)) == 0]
+                missing_market_daily_dates[market] = missing_dates
+                missing_market_daily_count[market] = len(missing_dates)
+
+        missing_daily_dates = [d for d in open_dates if int(daily_counts.get(d, 0)) == 0]
+        present_counts = [int(daily_counts[d]) for d in open_dates if int(daily_counts.get(d, 0)) > 0]
+        daily_rows_min = min(present_counts) if present_counts else None
+        daily_rows_max = max(present_counts) if present_counts else None
+        daily_rows_median = int(statistics.median_low(present_counts)) if present_counts else None
+
+        suspicious_dates: list[DataIntegrityCount] = []
+        if daily_rows_median is not None and suspicious_ratio > 0 and open_dates:
+            min_ok = max(1, int(math.floor(float(daily_rows_median) * float(suspicious_ratio))))
+            for d in open_dates:
+                n = int(daily_counts.get(d, 0))
+                if n <= 0:
+                    continue
+                if n < min_ok:
+                    suspicious_dates.append(DataIntegrityCount(trade_date=d, rows=n))
+
+        suspicious_dates.sort(key=lambda x: x.trade_date)
+
+        ok = True
+        if missing_update_log_dates:
+            ok = False
+        if missing_daily_dates:
+            ok = False
+        if suspicious_dates:
+            ok = False
+        if any(v > 0 for v in missing_market_daily_count.values()):
+            ok = False
+
+        def _limit(xs: list[str], n: int = 60) -> list[str]:
+            return xs[:n] if len(xs) > n else xs
+
+        def _limit_counts(xs: list[DataIntegrityCount], n: int = 60) -> list[DataIntegrityCount]:
+            return xs[:n] if len(xs) > n else xs
+
+        return DataIntegrityResponse(
+            ok=ok,
+            provider=provider,
+            price_adjust=eff_settings.price_adjust,
+            requested_date=str(date),
+            target_date=target_date,
+            lookback_days=lookback_days,
+            range_start=range_start,
+            range_end=target_date,
+            open_trade_dates=len(open_dates),
+            max_daily_trade_date=max_daily,
+            max_update_log_trade_date=max_log,
+            missing_update_log_count=len(missing_update_log_dates),
+            missing_update_log_dates=_limit(missing_update_log_dates),
+            missing_daily_count=len(missing_daily_dates),
+            missing_daily_dates=_limit(missing_daily_dates),
+            daily_rows_min=daily_rows_min,
+            daily_rows_median=daily_rows_median,
+            daily_rows_max=daily_rows_max,
+            suspicious_daily_count=len(suspicious_dates),
+            suspicious_daily_dates=_limit_counts(suspicious_dates),
+            market_stock_basic=market_stock_basic,
+            market_daily_rows_on_target_date=market_daily_rows_on_target_date,
+            missing_market_daily_count=missing_market_daily_count,
+            missing_market_daily_dates={k: _limit(v) for k, v in missing_market_daily_dates.items()},
+        )
 
     @app.post("/v1/export/ebk", dependencies=[Depends(_access_required)])
     def export_ebk(req: ScreenRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
