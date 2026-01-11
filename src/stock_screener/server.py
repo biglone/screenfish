@@ -287,6 +287,16 @@ class AvailabilityResponse(BaseModel):
     detail: str
 
 
+TradeDateOrder = Literal["asc", "desc"]
+
+
+class TradeDateListResponse(BaseModel):
+    price_adjust: Literal["none", "qfq", "hfq"]
+    total: int
+    order: TradeDateOrder
+    dates: list[str] = Field(default_factory=list)
+
+
 class DataIntegrityCount(BaseModel):
     trade_date: str
     rows: int
@@ -2098,6 +2108,35 @@ def create_app(*, settings: Settings) -> FastAPI:
             return AvailabilityResponse(date=date, provider=provider, available=False, detail="no sample rows yet")
         finally:
             bs.logout()
+
+    @app.get("/v1/data/trade-dates", response_model=TradeDateListResponse, dependencies=[Depends(_access_required)])
+    def list_trade_dates(
+        limit: int = Query(default=260, ge=1, le=5000),
+        offset: int = Query(default=0, ge=0),
+        order: TradeDateOrder = Query(default="desc"),
+        price_adjust: Literal["none", "qfq", "hfq"] | None = Query(default=None, description="Price adjust mode"),
+        settings: Settings = Depends(_settings_dep),
+    ) -> TradeDateListResponse:
+        eff_settings = settings
+        if price_adjust is not None:
+            eff_settings = settings.model_copy(update={"price_adjust": price_adjust})
+        backend = _backend(eff_settings)
+
+        direction = "ASC" if order == "asc" else "DESC"
+        with backend.connect() as conn:
+            row = conn.execute(f"SELECT COUNT(*) AS n FROM {backend.update_log_table}").fetchone()
+            total = int(row["n"] or 0) if row else 0
+            rows = conn.execute(
+                f"""
+                SELECT trade_date
+                FROM {backend.update_log_table}
+                ORDER BY trade_date {direction}
+                LIMIT ? OFFSET ?
+                """,
+                (int(limit), int(offset)),
+            ).fetchall()
+        dates = [str(r["trade_date"]) for r in rows if r["trade_date"]]
+        return TradeDateListResponse(price_adjust=eff_settings.price_adjust, total=total, order=order, dates=dates)
 
     @app.get("/v1/data/integrity", response_model=DataIntegrityResponse, dependencies=[Depends(_access_required)])
     def data_integrity(

@@ -150,6 +150,20 @@ def test_data_integrity_detects_missing_bj_rows(tmp_path: Path, monkeypatch) -> 
     assert body["missing_market_daily_count"]["BJ"] == 1
 
 
+def test_list_trade_dates_uses_update_log(tmp_path: Path) -> None:
+    settings = _seed_sqlite_one_day(tmp_path, "20240131")
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.get("/v1/data/trade-dates", params={"limit": 10})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["price_adjust"] == "none"
+    assert body["total"] == 1
+    assert body["order"] == "desc"
+    assert body["dates"] == ["20240131"]
+
+
 def test_auto_update_config_defaults_and_update(tmp_path: Path) -> None:
     settings = _seed_sqlite(tmp_path)
     app = create_app(settings=settings)
