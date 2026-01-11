@@ -30,6 +30,10 @@ class UpdateIncomplete(UpdateError):
     pass
 
 
+ADJUST_MODES: tuple[str, ...] = ("none", "qfq", "hfq")
+AUTO_BOOTSTRAP_DAYS: int = 260
+
+
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -61,7 +65,13 @@ def _resolve_start_end(
     # Auto mode: choose a recent lookback window to both fetch "latest" and repair gaps.
     last = backend.max_trade_date_in_update_log() or backend.max_trade_date_in_daily()
     if not last:
-        raise UpdateBadRequest("no local cache found; please specify --start for the first update")
+        # Bootstrap mode: if the table is empty, fetch a recent window so the user can start using the app
+        # without needing a full-history backfill.
+        if repair_days < 0:
+            raise UpdateBadRequest("repair-days must be >= 0")
+        bootstrap_days = max(repair_days, AUTO_BOOTSTRAP_DAYS)
+        start_eff = subtract_calendar_days(end_eff, bootstrap_days)
+        return start_eff, end_eff
     try:
         parse_yyyymmdd(last)
     except ValueError as e:
@@ -251,6 +261,66 @@ def update_daily(*, settings: Settings, start: str | None, end: str | None, prov
 
     try:
         update_daily_service(settings=settings, start=start, end=end, provider=provider, repair_days=repair_days)
+    except UpdateBadRequest as e:
+        raise typer.BadParameter(str(e)) from e
+    except UpdateNotConfigured as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=2) from e
+    except UpdateIncomplete as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+
+
+def update_daily_all_service(
+    *,
+    settings: Settings,
+    start: str | None,
+    end: str | None,
+    provider: str,
+    repair_days: int,
+    modes: tuple[str, ...] = ADJUST_MODES,
+) -> None:
+    """Update daily bars for all price-adjust modes (none/qfq/hfq)."""
+
+    provider_norm = (provider or "").strip().lower()
+    if provider_norm not in {"baostock", "tushare"}:
+        raise UpdateBadRequest("provider must be 'baostock' or 'tushare'")
+
+    errors_bad: dict[str, str] = {}
+    errors_incomplete: dict[str, str] = {}
+    for mode in modes:
+        mode_norm = (mode or "").strip().lower()
+        if mode_norm not in {"none", "qfq", "hfq"}:
+            raise UpdateBadRequest("price_adjust must be one of: none, qfq, hfq")
+        mode_settings = settings.model_copy(update={"price_adjust": mode_norm})
+        try:
+            update_daily_service(
+                settings=mode_settings,
+                start=start,
+                end=end,
+                provider=provider_norm,
+                repair_days=repair_days,
+            )
+        except UpdateNotConfigured:
+            # Provider not configured; fail fast as other modes will also fail.
+            raise
+        except UpdateBadRequest as e:
+            errors_bad[mode_norm] = str(e)
+        except UpdateIncomplete as e:
+            errors_incomplete[mode_norm] = str(e)
+
+    if errors_bad:
+        msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_bad.items())])
+        raise UpdateBadRequest(msg)
+    if errors_incomplete:
+        msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_incomplete.items())])
+        raise UpdateIncomplete(msg)
+
+
+def update_daily_all(*, settings: Settings, start: str | None, end: str | None, provider: str, repair_days: int) -> None:
+    """CLI-friendly wrapper for update_all."""
+    try:
+        update_daily_all_service(settings=settings, start=start, end=end, provider=provider, repair_days=repair_days)
     except UpdateBadRequest as e:
         raise typer.BadParameter(str(e)) from e
     except UpdateNotConfigured as e:

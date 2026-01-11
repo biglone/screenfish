@@ -10,7 +10,7 @@ from stock_screener.config import Settings
 from stock_screener.names import sync_names
 from stock_screener.runner import run_screen
 from stock_screener.tdx import write_ebk
-from stock_screener.update import update_daily
+from stock_screener.update import update_daily, update_daily_all
 from stock_screener.server import create_app
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -24,9 +24,14 @@ def update(
     repair_days: int = typer.Option(30, help="Auto mode lookback calendar days to repair gaps"),
     data_backend: str = typer.Option("sqlite", help="sqlite|parquet (only sqlite implemented)"),
     cache: Path = typer.Option(Path("./data"), help="Cache directory"),
-    price_adjust: str = typer.Option("none", help="Price adjust mode: none|qfq|hfq"),
+    price_adjust: str = typer.Option("all", help="Price adjust mode: all|none|qfq|hfq"),
 ) -> None:
-    settings = Settings(cache_dir=cache, data_backend=data_backend, price_adjust=price_adjust)
+    price_adjust_norm = (price_adjust or "").strip().lower()
+    if price_adjust_norm == "all":
+        settings = Settings(cache_dir=cache, data_backend=data_backend)
+        update_daily_all(settings=settings, start=start, end=end, provider=provider, repair_days=repair_days)
+        return
+    settings = Settings(cache_dir=cache, data_backend=data_backend, price_adjust=price_adjust_norm)
     update_daily(settings=settings, start=start, end=end, provider=provider, repair_days=repair_days)
 
 

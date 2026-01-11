@@ -56,7 +56,8 @@ from stock_screener.providers.tushare_provider import TuShareTokenMissing
 from stock_screener.runner import run_screen
 from stock_screener.tdx import TdxEbkFormat, ts_code_to_ebk_code
 from stock_screener.tushare_client import TuShareNotConfigured
-from stock_screener.update import UpdateBadRequest, UpdateIncomplete, UpdateNotConfigured, update_daily_service
+from stock_screener.update import UpdateBadRequest, UpdateIncomplete, UpdateNotConfigured
+from stock_screener.update import update_daily_all_service
 
 
 def _client_ip(request: Request) -> str | None:
@@ -265,6 +266,7 @@ class ScreenRequest(BaseModel):
     lookback_days: int = 200
     rules: str | None = None
     with_name: bool = False
+    price_adjust: Literal["none", "qfq", "hfq"] | None = None
 
 
 class ScreenResponse(BaseModel):
@@ -673,24 +675,37 @@ def create_app(*, settings: Settings) -> FastAPI:
     def _run_update_wait_job(*, job_id: str, settings: Settings) -> None:
         def _local_ready(trade_date: str) -> tuple[bool, str | None]:
             backend = _backend(settings)
+
+            def _tables(mode: str) -> tuple[str, str]:
+                m = (mode or "").strip().lower()
+                if m == "qfq":
+                    return "daily_qfq", "update_log_qfq"
+                if m == "hfq":
+                    return "daily_hfq", "update_log_hfq"
+                return "daily", "update_log"
+
+            latests: list[str] = []
+            ready = True
             with backend.connect() as conn:
-                row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {backend.daily_table}").fetchone()
-                latest = row["d"] if row else None
-                has_rows = (
-                    conn.execute(
-                        f"SELECT 1 FROM {backend.daily_table} WHERE trade_date = ? LIMIT 1",
+                for mode in ("none", "qfq", "hfq"):
+                    daily_table, update_log_table = _tables(mode)
+                    row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {daily_table}").fetchone()
+                    if row and row["d"] is not None:
+                        latests.append(str(row["d"]))
+                    has_rows = conn.execute(
+                        f"SELECT 1 FROM {daily_table} WHERE trade_date = ? LIMIT 1",
                         (trade_date,),
-                    ).fetchone()
-                    is not None
-                )
-                marked = (
-                    conn.execute(
-                        f"SELECT 1 FROM {backend.update_log_table} WHERE trade_date = ? LIMIT 1",
+                    ).fetchone() is not None
+                    marked = conn.execute(
+                        f"SELECT 1 FROM {update_log_table} WHERE trade_date = ? LIMIT 1",
                         (trade_date,),
-                    ).fetchone()
-                    is not None
-                )
-            return bool(has_rows and marked), (str(latest) if latest is not None else None)
+                    ).fetchone() is not None
+                    if not (has_rows and marked):
+                        ready = False
+                        break
+
+            latest = max(latests) if latests else None
+            return ready, latest
 
         while True:
             with update_wait_jobs_lock:
@@ -774,7 +789,13 @@ def create_app(*, settings: Settings) -> FastAPI:
                 job.message = f"updating (attempt {job.attempts})"
 
             try:
-                update_daily_service(settings=settings, start=None, end=target, provider=provider, repair_days=repair_days)
+                update_daily_all_service(
+                    settings=settings,
+                    start=None,
+                    end=target,
+                    provider=provider,
+                    repair_days=repair_days,
+                )
             except (UpdateBadRequest, UpdateNotConfigured) as e:
                 _, latest = _local_ready(target)
                 with update_wait_jobs_lock:
@@ -1721,7 +1742,13 @@ def create_app(*, settings: Settings) -> FastAPI:
     @app.post("/v1/update", dependencies=[Depends(_admin_required)])
     def update(req: UpdateRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
         try:
-            update_daily_service(settings=settings, start=req.start, end=req.end, provider=req.provider, repair_days=req.repair_days)
+            update_daily_all_service(
+                settings=settings,
+                start=req.start,
+                end=req.end,
+                provider=req.provider,
+                repair_days=req.repair_days,
+            )
         except (UpdateBadRequest, UpdateNotConfigured) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except UpdateIncomplete as e:
@@ -1796,7 +1823,10 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     @app.post("/v1/screen", response_model=ScreenResponse, dependencies=[Depends(_access_required)])
     def screen(req: ScreenRequest, settings: Settings = Depends(_settings_dep)) -> ScreenResponse:
-        backend = _backend(settings)
+        eff_settings = settings
+        if req.price_adjust is not None:
+            eff_settings = settings.model_copy(update={"price_adjust": req.price_adjust})
+        backend = _backend(eff_settings)
         date_value: str
         if req.date == "latest":
             max_daily = backend.max_trade_date_in_daily()
@@ -1812,7 +1842,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
         try:
             df = run_screen(
-                settings=settings,
+                settings=eff_settings,
                 date=date_value,
                 combo=req.combo,
                 lookback_days=req.lookback_days,
@@ -1871,7 +1901,10 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     @app.post("/v1/export/ebk", dependencies=[Depends(_access_required)])
     def export_ebk(req: ScreenRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
-        backend = _backend(settings)
+        eff_settings = settings
+        if req.price_adjust is not None:
+            eff_settings = settings.model_copy(update={"price_adjust": req.price_adjust})
+        backend = _backend(eff_settings)
         if req.date == "latest":
             max_daily = backend.max_trade_date_in_daily()
             if not max_daily:
@@ -1886,7 +1919,7 @@ def create_app(*, settings: Settings) -> FastAPI:
 
         try:
             df = run_screen(
-                settings=settings,
+                settings=eff_settings,
                 date=date_value,
                 combo=req.combo,
                 lookback_days=req.lookback_days,
@@ -1914,9 +1947,13 @@ def create_app(*, settings: Settings) -> FastAPI:
         search: str | None = Query(default=None, description="Search by ts_code or name"),
         limit: int = Query(default=100, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
+        price_adjust: Literal["none", "qfq", "hfq"] | None = Query(default=None, description="Price adjust mode"),
         settings: Settings = Depends(_settings_dep),
     ) -> StockListResponse:
-        backend = _backend(settings)
+        eff_settings = settings
+        if price_adjust is not None:
+            eff_settings = settings.model_copy(update={"price_adjust": price_adjust})
+        backend = _backend(eff_settings)
         with backend.connect() as conn:
             cur = conn.cursor()
             daily_table = backend.daily_table
@@ -2092,6 +2129,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         start: str | None = Query(default=None, description="Start date YYYYMMDD"),
         end: str | None = Query(default=None, description="End date YYYYMMDD"),
         limit: int = Query(default=250, ge=1, le=20000),
+        price_adjust: Literal["none", "qfq", "hfq"] | None = Query(default=None, description="Price adjust mode"),
         settings: Settings = Depends(_settings_dep),
     ) -> StockDailyResponse:
         start_parsed = None
@@ -2109,7 +2147,10 @@ def create_app(*, settings: Settings) -> FastAPI:
         if start_parsed is not None and end_parsed is not None and start_parsed > end_parsed:
             raise HTTPException(status_code=400, detail="start must be <= end")
 
-        backend = _backend(settings)
+        eff_settings = settings
+        if price_adjust is not None:
+            eff_settings = settings.model_copy(update={"price_adjust": price_adjust})
+        backend = _backend(eff_settings)
         with backend.connect() as conn:
             cur = conn.cursor()
             # Get stock name
@@ -2384,10 +2425,12 @@ def create_app(*, settings: Settings) -> FastAPI:
                 raise HTTPException(status_code=404, detail=f"watchlist group {group_id} not found")
 
             placeholders = ",".join(["?"] * len(ts_codes))
-            valid_rows = conn.execute(
-                f"SELECT DISTINCT ts_code FROM {backend.daily_table} WHERE ts_code IN ({placeholders})",
-                ts_codes,
-            ).fetchall()
+            union_query = (
+                f"SELECT ts_code FROM daily WHERE ts_code IN ({placeholders}) "
+                f"UNION SELECT ts_code FROM daily_qfq WHERE ts_code IN ({placeholders}) "
+                f"UNION SELECT ts_code FROM daily_hfq WHERE ts_code IN ({placeholders})"
+            )
+            valid_rows = conn.execute(union_query, ts_codes + ts_codes + ts_codes).fetchall()
             valid_ts_codes = {str(r["ts_code"]) for r in valid_rows}
             missing = [c for c in ts_codes if c not in valid_ts_codes]
             if missing:
@@ -2615,6 +2658,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         start: str | None = Query(default=None, description="Start date YYYYMMDD"),
         end: str | None = Query(default=None, description="End date YYYYMMDD"),
         limit: int = Query(default=250, ge=1, le=20000),
+        price_adjust: Literal["none", "qfq", "hfq"] | None = Query(default=None, description="Price adjust mode"),
         settings: Settings = Depends(_settings_dep),
     ) -> IndicatorSeriesResponse:
         """Evaluate an indicator formula and return points aligned to daily bars."""
@@ -2629,7 +2673,10 @@ def create_app(*, settings: Settings) -> FastAPI:
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
-        backend = _backend(settings)
+        eff_settings = settings
+        if price_adjust is not None:
+            eff_settings = settings.model_copy(update={"price_adjust": price_adjust})
+        backend = _backend(eff_settings)
         formula = backend.get_formula(formula_id)
         if not formula or formula.get("kind") != "indicator":
             raise HTTPException(status_code=404, detail=f"Indicator formula {formula_id} not found")

@@ -319,7 +319,7 @@ def test_update_wait_skips_baostock_update_until_published(tmp_path: Path, monke
 
     calls = {"update": 0}
 
-    def fake_update_daily_service(**_kwargs) -> None:
+    def fake_update_daily_all_service(**_kwargs) -> None:
         calls["update"] += 1
 
     def fake_probe_baostock_daily_available(*, trade_date: str) -> tuple[bool, str]:
@@ -328,7 +328,7 @@ def test_update_wait_skips_baostock_update_until_published(tmp_path: Path, monke
     def fake_resolve_wait_target_trade_date(*, provider: str, target_date: str, lookback_days: int = 30) -> str:
         return target_date
 
-    monkeypatch.setattr(server, "update_daily_service", fake_update_daily_service)
+    monkeypatch.setattr(server, "update_daily_all_service", fake_update_daily_all_service)
     monkeypatch.setattr(server, "probe_baostock_daily_available", fake_probe_baostock_daily_available)
     monkeypatch.setattr(server, "resolve_wait_target_trade_date", fake_resolve_wait_target_trade_date)
 
@@ -359,10 +359,8 @@ def test_update_wait_baostock_succeeds_after_update(tmp_path: Path, monkeypatch)
 
     calls = {"update": 0}
 
-    def fake_update_daily_service(*, settings: Settings, start, end, provider, repair_days) -> None:
+    def fake_update_daily_all_service(*, settings: Settings, start, end, provider, repair_days) -> None:
         calls["update"] += 1
-        backend = SqliteBackend(settings.sqlite_path)
-        backend.init()
         df = pd.DataFrame(
             [
                 {
@@ -377,8 +375,17 @@ def test_update_wait_baostock_succeeds_after_update(tmp_path: Path, monkeypatch)
                 }
             ]
         )
-        backend.upsert_daily_df(df)
-        backend.mark_trade_date_updated(str(end))
+        for mode in ("none", "qfq", "hfq"):
+            mode_settings = settings.model_copy(update={"price_adjust": mode})
+            backend = SqliteBackend(
+                mode_settings.sqlite_path,
+                daily_table=mode_settings.daily_table,
+                update_log_table=mode_settings.update_log_table,
+                provider_stock_progress_table=mode_settings.provider_stock_progress_table,
+            )
+            backend.init()
+            backend.upsert_daily_df(df)
+            backend.mark_trade_date_updated(str(end))
 
     def fake_probe_baostock_daily_available(*, trade_date: str) -> tuple[bool, str]:
         return True, f"published: {trade_date}"
@@ -386,7 +393,7 @@ def test_update_wait_baostock_succeeds_after_update(tmp_path: Path, monkeypatch)
     def fake_resolve_wait_target_trade_date(*, provider: str, target_date: str, lookback_days: int = 30) -> str:
         return target_date
 
-    monkeypatch.setattr(server, "update_daily_service", fake_update_daily_service)
+    monkeypatch.setattr(server, "update_daily_all_service", fake_update_daily_all_service)
     monkeypatch.setattr(server, "probe_baostock_daily_available", fake_probe_baostock_daily_available)
     monkeypatch.setattr(server, "resolve_wait_target_trade_date", fake_resolve_wait_target_trade_date)
 

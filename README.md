@@ -53,15 +53,20 @@ export TUSHARE_TOKEN="你的token"
 - `hfq`：后复权（BaoStock `adjustflag=1`）
 
 配置方式：
-- **API/Docker**：设置环境变量 `STOCK_SCREENER_PRICE_ADJUST=none|qfq|hfq`
-- **CLI**：使用 `--price-adjust none|qfq|hfq`
+- **API/Docker**：
+  - `STOCK_SCREENER_PRICE_ADJUST=none|qfq|hfq` 仅影响**默认读取口径**（不传参时的默认筛选/行情）
+  - `/v1/update` 默认会同时更新 `none/qfq/hfq` 三套口径数据（同库分表）
+- **CLI**：
+  - `stock_screener update` 默认更新 `all`（三套口径）
+  - 如需只更新一种：`--price-adjust none|qfq|hfq`
 
 同一个 `daily.sqlite3` 内会分别存储不同口径的数据：
 - 日线表：`daily` / `daily_qfq` / `daily_hfq`
 - 更新日志：`update_log` / `update_log_qfq` / `update_log_hfq`
 - 更新进度：`provider_stock_progress` / `provider_stock_progress_qfq` / `provider_stock_progress_hfq`
 
-切换口径后需要先跑一次 `update`（对应口径的表是空的）。
+筛选时可在请求中指定口径：
+- **API**：`POST /v1/screen` 请求体支持 `price_adjust=none|qfq|hfq`
 
 ## 更新数据
 
