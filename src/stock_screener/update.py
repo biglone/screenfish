@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import date as _date
+import sqlite3
 
+import pandas as pd
 import typer
 
 from stock_screener.backends.sqlite_backend import SqliteBackend
@@ -10,6 +12,7 @@ from stock_screener.dates import format_yyyymmdd, parse_yyyymmdd, subtract_calen
 from stock_screener.providers import get_provider
 from stock_screener.providers.baostock_provider import BaoStockNotConfigured
 from stock_screener.providers.baostock_provider import bs_to_ts_code
+from stock_screener.providers.eastmoney_provider import EastmoneyProvider
 from stock_screener.providers.tushare_provider import TuShareTokenMissing
 from stock_screener.tushare_client import TuShareNotConfigured
 
@@ -129,6 +132,47 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
         return
 
     if getattr(p, "name", "") == "baostock":
+        def _bj_ts_codes(conn) -> list[str]:
+            codes: set[str] = set()
+            for q in (
+                "SELECT DISTINCT ts_code FROM watchlist_items WHERE ts_code LIKE '%.BJ'",
+                "SELECT ts_code FROM stock_basic WHERE ts_code LIKE '%.BJ'",
+            ):
+                try:
+                    rows = conn.execute(q).fetchall()
+                except sqlite3.OperationalError:
+                    continue
+                for r in rows:
+                    v = r["ts_code"]
+                    if v:
+                        codes.add(str(v))
+            return sorted(codes)
+
+        def _update_bj(*, range_start: str, range_end: str) -> None:
+            with backend.connect() as conn:
+                codes = _bj_ts_codes(conn)
+                if not codes:
+                    return
+                provider = EastmoneyProvider()
+                basics: list[dict[str, str]] = []
+                for ts_code in codes:
+                    try:
+                        df, name = provider.fetch_daily(
+                            ts_code=ts_code,
+                            start=range_start,
+                            end=range_end,
+                            adjust=settings.price_adjust,  # type: ignore[arg-type]
+                        )
+                    except Exception as e:
+                        typer.echo(f"warning: eastmoney update failed for {ts_code}: {e}", err=True)
+                        continue
+                    if not df.empty:
+                        backend.upsert_daily_df_in_conn(conn, df)
+                    if name:
+                        basics.append({"ts_code": ts_code, "name": name})
+                if basics:
+                    backend.upsert_stock_basic_df_in_conn(conn, pd.DataFrame(basics).drop_duplicates(subset=["ts_code"]))
+
         # Always sync stock names when using baostock
         def _sync_stock_names(bs, day: str) -> None:
             try:
@@ -145,6 +189,8 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
             if max_date:
                 with p.session() as bs:
                     _sync_stock_names(bs, max_date)
+            # Still try to keep BJ symbols updated (BaoStock doesn't cover them).
+            _update_bj(range_start=start_eff, range_end=end_eff)
             typer.echo("done")
             return
 
@@ -244,6 +290,7 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
             backend.clear_progress(provider=provider_name, range_start=range_start, range_end=range_end)
             remaining = [d for d in missing_sorted if d not in dates_with_rows]
             raise UpdateIncomplete(f"partial update; remaining dates: {remaining}; rerun to resume")
+        _update_bj(range_start=range_start, range_end=range_end)
         typer.echo("done")
         return
 

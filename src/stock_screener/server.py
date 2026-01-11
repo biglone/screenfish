@@ -2438,6 +2438,39 @@ def create_app(*, settings: Settings) -> FastAPI:
             valid_rows = conn.execute(union_query, ts_codes + ts_codes + ts_codes).fetchall()
             valid_ts_codes = {str(r["ts_code"]) for r in valid_rows}
             missing = [c for c in ts_codes if c not in valid_ts_codes]
+            # Best-effort: BaoStock doesn't cover BJ; try to backfill missing BJ symbols via Eastmoney.
+            bj_missing = [c for c in missing if c.endswith(".BJ")]
+            if bj_missing:
+                try:
+                    from stock_screener.providers.eastmoney_provider import EastmoneyProvider
+
+                    provider = EastmoneyProvider()
+                    backends: dict[str, SqliteBackend] = {
+                        "none": SqliteBackend(settings.sqlite_path, daily_table="daily"),
+                        "qfq": SqliteBackend(settings.sqlite_path, daily_table="daily_qfq"),
+                        "hfq": SqliteBackend(settings.sqlite_path, daily_table="daily_hfq"),
+                    }
+                    basics: list[dict[str, str]] = []
+                    for code in bj_missing[:50]:
+                        # Full history is OK here; BJ coverage is typically small.
+                        for mode, b in backends.items():
+                            try:
+                                df, name = provider.fetch_daily(ts_code=code, adjust=mode)  # type: ignore[arg-type]
+                            except Exception:
+                                continue
+                            if not df.empty:
+                                b.upsert_daily_df_in_conn(conn, df)
+                            if name:
+                                basics.append({"ts_code": code, "name": name})
+                    if basics:
+                        backend.upsert_stock_basic_df_in_conn(conn, pd.DataFrame(basics).drop_duplicates(subset=["ts_code"]))
+                except Exception:
+                    # Ignore; we'll fall back to treating them as unknown.
+                    pass
+
+                valid_rows = conn.execute(union_query, ts_codes + ts_codes + ts_codes).fetchall()
+                valid_ts_codes = {str(r["ts_code"]) for r in valid_rows}
+                missing = [c for c in ts_codes if c not in valid_ts_codes]
             if missing and not bool(getattr(req, "ignore_unknown", False)):
                 sample = ", ".join(missing[:10])
                 more = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"

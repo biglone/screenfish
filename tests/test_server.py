@@ -189,6 +189,54 @@ def test_watchlist_groups_and_items_crud(tmp_path: Path) -> None:
     assert any(g["id"] == "default" for g in r8.json()["groups"])
 
 
+def test_watchlist_import_backfills_bj_symbols(tmp_path: Path, monkeypatch) -> None:
+    import stock_screener.providers.eastmoney_provider as em
+
+    settings = _seed_sqlite(tmp_path)
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r2 = client.post("/v1/watchlist/groups", json={"name": "BJ"})
+    assert r2.status_code == 200
+    group_id = r2.json()["id"]
+
+    def fake_fetch_daily(self, *, ts_code: str, start=None, end=None, adjust="none"):  # noqa: ANN001
+        df = pd.DataFrame(
+            [
+                {
+                    "ts_code": ts_code.upper(),
+                    "trade_date": "20240131",
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                }
+            ]
+        )
+        return df, "安达科技"
+
+    monkeypatch.setattr(em.EastmoneyProvider, "fetch_daily", fake_fetch_daily)
+
+    r3 = client.post(
+        f"/v1/watchlist/groups/{group_id}/items",
+        json={"items": [{"ts_code": "920809.BJ"}]},
+    )
+    assert r3.status_code == 200
+    assert r3.json()["ok"] is True
+    assert r3.json().get("unknown_total") in (None, 0)
+
+    # Ensure the symbol is searchable under qfq as well.
+    r4 = client.get("/v1/stocks", params={"search": "920809.BJ", "limit": 10, "offset": 0, "price_adjust": "qfq"})
+    assert r4.status_code == 200
+    assert any(s["ts_code"] == "920809.BJ" for s in r4.json()["stocks"])
+
+    r5 = client.get("/v1/stocks/920809.BJ/daily", params={"price_adjust": "qfq", "limit": 10})
+    assert r5.status_code == 200
+    assert r5.json()["ts_code"] == "920809.BJ"
+
+
 def test_auth_register_login_and_isolation(tmp_path: Path, monkeypatch) -> None:
     settings = _seed_sqlite(tmp_path)
     monkeypatch.setenv("STOCK_SCREENER_AUTH_ENABLED", "1")
