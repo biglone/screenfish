@@ -64,6 +64,9 @@ def run_screen(
     df = df.copy()
     df["trade_date"] = df["trade_date"].astype(str)
     df = df.sort_values(["ts_code", "trade_date"], kind="mergesort").reset_index(drop=True)
+    df = df.loc[df["vol"].notna() & df["amount"].notna() & ~((df["vol"] == 0) & (df["amount"] == 0))].reset_index(
+        drop=True
+    )
 
     try:
         rule_objs = resolve_rules(rules, backend=backend)
