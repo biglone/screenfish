@@ -339,6 +339,7 @@ class WatchlistGroupUpdate(BaseModel):
 
 class WatchlistItemsUpsertRequest(BaseModel):
     items: list[WatchlistItem] = Field(..., min_length=1)
+    ignore_unknown: bool = False
 
 
 class WatchlistItemsRemoveRequest(BaseModel):
@@ -2417,6 +2418,7 @@ def create_app(*, settings: Settings) -> FastAPI:
         if invalid_format:
             raise HTTPException(status_code=400, detail=f"invalid ts_code: {invalid_format[0]}")
         now = int(time.time())
+        missing: list[str] = []
 
         backend = _backend(settings)
         with backend.connect() as conn:
@@ -2436,10 +2438,16 @@ def create_app(*, settings: Settings) -> FastAPI:
             valid_rows = conn.execute(union_query, ts_codes + ts_codes + ts_codes).fetchall()
             valid_ts_codes = {str(r["ts_code"]) for r in valid_rows}
             missing = [c for c in ts_codes if c not in valid_ts_codes]
-            if missing:
+            if missing and not bool(getattr(req, "ignore_unknown", False)):
                 sample = ", ".join(missing[:10])
                 more = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"
                 raise HTTPException(status_code=400, detail=f"unknown ts_code(s): {sample}{more}")
+            if missing:
+                ts_codes = [c for c in ts_codes if c in valid_ts_codes]
+                if not ts_codes:
+                    sample = ", ".join(missing[:10])
+                    more = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"
+                    raise HTTPException(status_code=400, detail=f"no valid ts_code(s); unknown: {sample}{more}")
 
             name_by_code: dict[str, str | None] = {}
             for item in items:
@@ -2481,7 +2489,11 @@ def create_app(*, settings: Settings) -> FastAPI:
                 "SELECT COUNT(1) AS c FROM watchlist_items WHERE owner_id = ? AND group_id = ?",
                 (owner_id, group_id),
             ).fetchone()["c"]
-        return {"ok": True, "group_id": group_id, "updated_at": now, "total": int(total)}
+        resp: dict[str, Any] = {"ok": True, "group_id": group_id, "updated_at": now, "total": int(total)}
+        if missing:
+            resp["unknown_total"] = len(missing)
+            resp["unknown"] = missing[:50]
+        return resp
 
     @app.post(
         "/v1/watchlist/groups/{group_id}/items/remove",
