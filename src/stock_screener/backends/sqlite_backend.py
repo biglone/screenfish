@@ -242,6 +242,18 @@ class SqliteBackend:
                 "CREATE INDEX IF NOT EXISTS idx_stock_basic_pinyin_full ON stock_basic (pinyin_full)"
             )
 
+        # auto_update_config: add runtime status columns for older DBs.
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "last_run_at"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN last_run_at INTEGER")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "last_success_at"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN last_success_at INTEGER")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "last_success_trade_date"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN last_success_trade_date TEXT")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "last_error"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN last_error TEXT")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "updated_at"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
+
         try:
             from stock_screener.pinyin import pinyin_full as _pinyin_full
             from stock_screener.pinyin import pinyin_initials as _pinyin_initials

@@ -148,9 +148,37 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
                         codes.add(str(v))
             return sorted(codes)
 
-        def _update_bj(*, range_start: str, range_end: str) -> None:
+        def _bj_ts_codes_missing_trade_date(conn, trade_date: str) -> list[str]:
+            try:
+                rows = conn.execute(
+                    f"""
+                    WITH bj AS (
+                      SELECT DISTINCT ts_code FROM watchlist_items WHERE ts_code LIKE '%.BJ'
+                      UNION
+                      SELECT ts_code FROM stock_basic WHERE ts_code LIKE '%.BJ'
+                    )
+                    SELECT bj.ts_code
+                    FROM bj
+                    WHERE NOT EXISTS (
+                      SELECT 1
+                      FROM {backend.daily_table} d
+                      WHERE d.ts_code = bj.ts_code
+                        AND d.trade_date = ?
+                    )
+                    """,
+                    (trade_date,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+            return sorted({str(r["ts_code"]) for r in rows if r["ts_code"]})
+
+        def _update_bj(*, range_start: str, range_end: str, only_missing_trade_date: str | None = None) -> None:
             with backend.connect() as conn:
-                codes = _bj_ts_codes(conn)
+                codes = (
+                    _bj_ts_codes_missing_trade_date(conn, only_missing_trade_date)
+                    if only_missing_trade_date
+                    else _bj_ts_codes(conn)
+                )
                 if not codes:
                     return
                 provider = EastmoneyProvider()
@@ -189,8 +217,8 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
             if max_date:
                 with p.session() as bs:
                     _sync_stock_names(bs, max_date)
-            # Still try to keep BJ symbols updated (BaoStock doesn't cover them).
-            _update_bj(range_start=start_eff, range_end=end_eff)
+                # Still try to keep BJ symbols up-to-date when local daily is already up-to-date.
+                _update_bj(range_start=max_date, range_end=max_date, only_missing_trade_date=max_date)
             typer.echo("done")
             return
 

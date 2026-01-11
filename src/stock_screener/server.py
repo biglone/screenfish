@@ -258,6 +258,10 @@ class AutoUpdateConfig(BaseModel):
     interval_seconds: int = Field(default=600, ge=1)
     provider: Literal["baostock", "tushare"] = "baostock"
     repair_days: int = Field(default=30, ge=0)
+    last_run_at: int | None = None
+    last_success_at: int | None = None
+    last_success_trade_date: str | None = None
+    last_error: str | None = None
 
 
 class ScreenRequest(BaseModel):
@@ -596,7 +600,19 @@ def create_app(*, settings: Settings) -> FastAPI:
                 # Best-effort only; ignore warmup failures.
                 pass
 
-        yield
+        auto_update_stop = threading.Event()
+        auto_update_thread = threading.Thread(
+            target=_auto_update_loop,
+            kwargs={"settings": settings, "stop_event": auto_update_stop},
+            daemon=True,
+        )
+        auto_update_thread.start()
+
+        try:
+            yield
+        finally:
+            auto_update_stop.set()
+            auto_update_thread.join(timeout=5.0)
 
     enabled_auth = auth_enabled()
     secret: bytes | None = None
@@ -639,6 +655,132 @@ def create_app(*, settings: Settings) -> FastAPI:
 
     update_wait_jobs: dict[str, _UpdateWaitJob] = {}
     update_wait_jobs_lock = threading.Lock()
+    update_lock = threading.Lock()
+
+    def _auto_update_loop(*, settings: Settings, stop_event: threading.Event) -> None:
+        backend = _backend(settings)
+        idle_sleep = 5.0
+
+        while not stop_event.is_set():
+            try:
+                with backend.connect() as conn:
+                    conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                    row = conn.execute(
+                        """
+                        SELECT enabled, interval_seconds, provider, repair_days, last_run_at
+                        FROM auto_update_config
+                        WHERE id = 1
+                        LIMIT 1
+                        """
+                    ).fetchone()
+
+                if not row or int(row["enabled"] or 0) != 1:
+                    stop_event.wait(idle_sleep)
+                    continue
+
+                provider = str(row["provider"] or "baostock")
+                if provider not in {"baostock", "tushare"}:
+                    provider = "baostock"
+                interval_seconds = int(row["interval_seconds"] or 600)
+                if interval_seconds < 1:
+                    interval_seconds = 600
+                repair_days = int(row["repair_days"] or 30)
+                if repair_days < 0:
+                    repair_days = 30
+
+                now = int(time.time())
+                last_run_at_raw = row["last_run_at"]
+                if last_run_at_raw is None:
+                    # Initialize schedule on first enable; wait interval before first run.
+                    with backend.connect() as conn:
+                        conn.execute(
+                            "UPDATE auto_update_config SET last_run_at = ?, updated_at = ? WHERE id = 1",
+                            (now, now),
+                        )
+                    stop_event.wait(idle_sleep)
+                    continue
+
+                last_run_at = int(last_run_at_raw or 0)
+                due_in = interval_seconds - max(0, now - last_run_at)
+                if due_in > 0:
+                    stop_event.wait(min(idle_sleep, float(due_in)))
+                    continue
+
+                if not update_lock.acquire(timeout=1.0):
+                    stop_event.wait(idle_sleep)
+                    continue
+
+                try:
+                    run_started_at = int(time.time())
+                    with backend.connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE auto_update_config
+                            SET last_run_at = ?, last_error = NULL, updated_at = ?
+                            WHERE id = 1
+                            """,
+                            (run_started_at, run_started_at),
+                        )
+
+                    try:
+                        update_daily_all_service(
+                            settings=settings,
+                            start=None,
+                            end=None,
+                            provider=provider,
+                            repair_days=repair_days,
+                        )
+                    except UpdateIncomplete as e:
+                        msg = (str(e) or "update incomplete")[:2000]
+                        with backend.connect() as conn:
+                            now2 = int(time.time())
+                            conn.execute(
+                                "UPDATE auto_update_config SET last_error = ?, updated_at = ? WHERE id = 1",
+                                (msg, now2),
+                            )
+                    except (UpdateBadRequest, UpdateNotConfigured) as e:
+                        msg = (str(e) or "update failed")[:2000]
+                        with backend.connect() as conn:
+                            now2 = int(time.time())
+                            conn.execute(
+                                "UPDATE auto_update_config SET last_error = ?, updated_at = ? WHERE id = 1",
+                                (msg, now2),
+                            )
+                    except Exception as e:
+                        msg = (str(e) or "update failed")[:2000]
+                        with backend.connect() as conn:
+                            now2 = int(time.time())
+                            conn.execute(
+                                "UPDATE auto_update_config SET last_error = ?, updated_at = ? WHERE id = 1",
+                                (msg, now2),
+                            )
+                    else:
+                        with backend.connect() as conn:
+                            now2 = int(time.time())
+                            latests: list[str] = []
+                            for table in ("update_log", "update_log_qfq", "update_log_hfq"):
+                                try:
+                                    r = conn.execute(f"SELECT MAX(trade_date) AS d FROM {table}").fetchone()
+                                except sqlite3.OperationalError:
+                                    continue
+                                if r and r["d"] is not None:
+                                    latests.append(str(r["d"]))
+                            latest = max(latests) if latests else None
+                            conn.execute(
+                                """
+                                UPDATE auto_update_config
+                                SET last_success_at = ?, last_success_trade_date = ?, last_error = NULL, updated_at = ?
+                                WHERE id = 1
+                                """,
+                                (now2, latest, now2),
+                            )
+                finally:
+                    update_lock.release()
+
+                stop_event.wait(1.0)
+            except Exception:
+                # Best-effort only; avoid crashing the background thread.
+                stop_event.wait(idle_sleep)
 
     def _cleanup_update_wait_jobs(*, max_jobs: int = 200, max_age_seconds: int = 24 * 60 * 60) -> None:
         now = time.time()
@@ -791,13 +933,14 @@ def create_app(*, settings: Settings) -> FastAPI:
                 job.message = f"updating (attempt {job.attempts})"
 
             try:
-                update_daily_all_service(
-                    settings=settings,
-                    start=None,
-                    end=target,
-                    provider=provider,
-                    repair_days=repair_days,
-                )
+                with update_lock:
+                    update_daily_all_service(
+                        settings=settings,
+                        start=None,
+                        end=target,
+                        provider=provider,
+                        repair_days=repair_days,
+                    )
             except (UpdateBadRequest, UpdateNotConfigured) as e:
                 _, latest = _local_ready(target)
                 with update_wait_jobs_lock:
@@ -1704,7 +1847,13 @@ def create_app(*, settings: Settings) -> FastAPI:
         with backend.connect() as conn:
             conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
             row = conn.execute(
-                "SELECT enabled, interval_seconds, provider, repair_days FROM auto_update_config WHERE id = 1 LIMIT 1"
+                """
+                SELECT enabled, interval_seconds, provider, repair_days,
+                       last_run_at, last_success_at, last_success_trade_date, last_error
+                FROM auto_update_config
+                WHERE id = 1
+                LIMIT 1
+                """
             ).fetchone()
         if not row:
             raise HTTPException(status_code=500, detail="auto_update_config missing")
@@ -1723,6 +1872,10 @@ def create_app(*, settings: Settings) -> FastAPI:
             interval_seconds=interval_seconds,
             provider=provider,  # type: ignore[arg-type]
             repair_days=repair_days,
+            last_run_at=int(row["last_run_at"]) if row["last_run_at"] is not None else None,
+            last_success_at=int(row["last_success_at"]) if row["last_success_at"] is not None else None,
+            last_success_trade_date=str(row["last_success_trade_date"]) if row["last_success_trade_date"] else None,
+            last_error=str(row["last_error"]) if row["last_error"] else None,
         )
 
     @app.put("/auto-update-config", response_model=AutoUpdateConfig, dependencies=[Depends(_admin_required)])
@@ -1731,26 +1884,33 @@ def create_app(*, settings: Settings) -> FastAPI:
         now = int(time.time())
         with backend.connect() as conn:
             conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+            prev = conn.execute("SELECT last_run_at FROM auto_update_config WHERE id = 1 LIMIT 1").fetchone()
+            last_run_at = prev["last_run_at"] if prev else None
+            if req.enabled and last_run_at is None:
+                # First enable: schedule next run after interval.
+                last_run_at = now
             conn.execute(
                 """
                 UPDATE auto_update_config
-                SET enabled = ?, interval_seconds = ?, provider = ?, repair_days = ?, updated_at = ?
+                SET enabled = ?, interval_seconds = ?, provider = ?, repair_days = ?,
+                    last_run_at = ?, last_error = NULL, updated_at = ?
                 WHERE id = 1
                 """,
-                (1 if req.enabled else 0, req.interval_seconds, req.provider, req.repair_days, now),
+                (1 if req.enabled else 0, req.interval_seconds, req.provider, req.repair_days, last_run_at, now),
             )
         return get_auto_update_config(settings=settings)
 
     @app.post("/v1/update", dependencies=[Depends(_admin_required)])
     def update(req: UpdateRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
         try:
-            update_daily_all_service(
-                settings=settings,
-                start=req.start,
-                end=req.end,
-                provider=req.provider,
-                repair_days=req.repair_days,
-            )
+            with update_lock:
+                update_daily_all_service(
+                    settings=settings,
+                    start=req.start,
+                    end=req.end,
+                    provider=req.provider,
+                    repair_days=req.repair_days,
+                )
         except (UpdateBadRequest, UpdateNotConfigured) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except UpdateIncomplete as e:
