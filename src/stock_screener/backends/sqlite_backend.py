@@ -211,8 +211,8 @@ class SqliteBackend:
         if not _has_column("formulas", "timeframe"):
             conn.execute("ALTER TABLE formulas ADD COLUMN timeframe TEXT")
 
-        # Data migration: add MA13 (EMA13) output for the built-in indicator formula if it only defines MA2 via ':='.
-        # This keeps MA60 yellow and lets the web render MA13 as muted/grey.
+        # Data migration: keep the built-in indicator aligned with TongDaXin's default display:
+        # MA2 is an assignment (":=") and should not be plotted as an output line (":").
         try:
             row = conn.execute(
                 "SELECT id, formula FROM formulas WHERE name = ? AND kind = 'indicator' LIMIT 1",
@@ -222,22 +222,24 @@ class SqliteBackend:
                 formula_id = int(row["id"])
                 formula_raw = str(row["formula"] or "")
 
-                has_ma13_output = re.search(r"\bMA13\s*:(?!\=)", formula_raw, flags=re.IGNORECASE) is not None
-                has_ma2_output = re.search(r"\bMA2\s*:(?!\=)", formula_raw, flags=re.IGNORECASE) is not None
                 has_ma2_assign = re.search(
                     r"\bMA2\s*:=\s*EMA\s*\(\s*CLOSE\s*,\s*13\s*\)\s*;?",
                     formula_raw,
                     flags=re.IGNORECASE,
                 ) is not None
+                ma13_mentions = re.findall(r"\bMA13\b", formula_raw, flags=re.IGNORECASE)
+                has_ma13_alias_output = (
+                    re.search(r"(?m)^\s*MA13\s*:\s*MA2\s*;\s*$", formula_raw, flags=re.IGNORECASE) is not None
+                )
 
-                if has_ma2_assign and not has_ma13_output and not has_ma2_output:
+                if has_ma2_assign and has_ma13_alias_output and len(ma13_mentions) == 1:
                     updated_formula = re.sub(
-                        r"(\bMA2\s*:=\s*EMA\s*\(\s*CLOSE\s*,\s*13\s*\)\s*;?)",
-                        r"\1\nMA13:MA2;",
+                        r"(?m)^\s*MA13\s*:\s*MA2\s*;\s*\n?",
+                        "",
                         formula_raw,
                         count=1,
                         flags=re.IGNORECASE,
-                    )
+                    ).rstrip() + "\n"
                     if updated_formula != formula_raw:
                         now = datetime.now(timezone.utc).isoformat()
                         conn.execute(
