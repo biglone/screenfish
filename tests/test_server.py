@@ -354,6 +354,89 @@ def test_auto_update_config_defaults_and_update(tmp_path: Path) -> None:
     assert r3.json() == cfg2
 
 
+def test_auto_screen_config_defaults_and_update(tmp_path: Path) -> None:
+    settings = _seed_sqlite(tmp_path)
+    backend = SqliteBackend(settings.sqlite_path)
+    backend.create_formula(name="always_true", formula="CLOSE>0", kind="screen", enabled=True)
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.get("/auto-screen-config")
+    assert r.status_code == 200
+    cfg = r.json()
+    assert cfg["enabled"] is False
+    assert cfg["group_name"] == "自动筛选"
+    assert cfg["combo"] == "and"
+    assert cfg["lookback_days"] == 200
+    assert cfg["exclude_st"] is False
+    assert cfg["price_adjust"] == "qfq"
+    assert cfg["replace_group"] is True
+
+    r2 = client.put(
+        "/auto-screen-config",
+        json={
+            "enabled": True,
+            "group_name": "自动筛选",
+            "combo": "and",
+            "rules": "always_true",
+            "lookback_days": 120,
+            "with_name": False,
+            "exclude_st": True,
+            "price_adjust": "qfq",
+            "replace_group": True,
+        },
+    )
+    assert r2.status_code == 200
+    cfg2 = r2.json()
+    assert cfg2["enabled"] is True
+    assert cfg2["rules"] == "always_true"
+    assert cfg2["lookback_days"] == 120
+    assert cfg2["exclude_st"] is True
+    assert cfg2["replace_group"] is True
+
+
+def test_auto_screen_run_writes_watchlist_group(tmp_path: Path) -> None:
+    settings = _seed_sqlite(tmp_path)
+    backend = SqliteBackend(settings.sqlite_path)
+    backend.create_formula(name="always_true", formula="CLOSE>0", kind="screen", enabled=True)
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r0 = client.put(
+        "/auto-screen-config",
+        json={
+            "enabled": True,
+            "group_name": "自动筛选",
+            "combo": "and",
+            "rules": "always_true",
+            "lookback_days": 5,
+            "with_name": False,
+            "exclude_st": False,
+            "price_adjust": "none",
+            "replace_group": True,
+        },
+    )
+    assert r0.status_code == 200
+
+    r1 = client.post("/v1/auto-screen/run", json={"date": "latest", "force": True})
+    assert r1.status_code == 200
+    body = r1.json()
+    assert body["ok"] is True
+    assert body["trade_date"] == "20240131"
+    assert body["count"] == 1
+    group_id = body["group_id"]
+
+    r2 = client.get("/v1/watchlist")
+    assert r2.status_code == 200
+    groups = {g["id"]: g for g in r2.json()["groups"]}
+    assert group_id in groups
+    items = groups[group_id]["items"]
+    assert any(i["ts_code"] == "000001.SZ" for i in items)
+    assert any(i["name"] == "平安银行" for i in items)
+
+
 def test_screen_latest(tmp_path: Path) -> None:
     settings = _seed_sqlite(tmp_path)
     app = create_app(settings=settings)

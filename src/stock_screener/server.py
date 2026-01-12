@@ -54,6 +54,7 @@ from stock_screener.pinyin import pinyin_full, pinyin_initials
 from stock_screener.providers import get_provider
 from stock_screener.providers.baostock_provider import BaoStockNotConfigured
 from stock_screener.providers.tushare_provider import TuShareTokenMissing
+from stock_screener.rules import resolve_rules
 from stock_screener.runner import run_screen
 from stock_screener.tdx import TdxEbkFormat, ts_code_to_ebk_code
 from stock_screener.tushare_client import TuShareNotConfigured
@@ -263,6 +264,52 @@ class AutoUpdateConfig(BaseModel):
     last_success_at: int | None = None
     last_success_trade_date: str | None = None
     last_error: str | None = None
+
+
+class AutoScreenConfig(BaseModel):
+    enabled: bool = False
+    group_name: str = Field(default="自动筛选", min_length=1, max_length=30)
+    group_id: str | None = None
+
+    combo: Literal["and", "or"] = "and"
+    rules: str | None = None
+    lookback_days: int = Field(default=200, ge=0, le=20000)
+    with_name: bool = False
+    exclude_st: bool = False
+    price_adjust: Literal["none", "qfq", "hfq"] = "qfq"
+    replace_group: bool = True
+
+    last_run_at: int | None = None
+    last_trade_date: str | None = None
+    last_count: int | None = None
+    last_error: str | None = None
+
+
+class AutoScreenConfigUpdate(BaseModel):
+    enabled: bool = False
+    group_name: str = Field(default="自动筛选", min_length=1, max_length=30)
+    combo: Literal["and", "or"] = "and"
+    rules: str | None = None
+    lookback_days: int = Field(default=200, ge=0, le=20000)
+    with_name: bool = False
+    exclude_st: bool = False
+    price_adjust: Literal["none", "qfq", "hfq"] = "qfq"
+    replace_group: bool = True
+
+
+class AutoScreenRunResponse(BaseModel):
+    ok: bool
+    trade_date: str
+    count: int
+    group_id: str
+    group_name: str
+    message: str
+    last_error: str | None = None
+
+
+class AutoScreenRunRequest(BaseModel):
+    date: str | Literal["latest"] = "latest"
+    force: bool = False
 
 
 class ScreenRequest(BaseModel):
@@ -704,6 +751,110 @@ def create_app(*, settings: Settings) -> FastAPI:
     update_wait_jobs_lock = threading.Lock()
     update_lock = threading.Lock()
 
+    def _normalize_watchlist_group_name(name: str) -> str:
+        return re.sub(r"\s+", " ", str(name or "").strip())[:30]
+
+    def _ensure_default_watchlist_group(conn: Any, owner_id: str) -> None:
+        row = conn.execute(
+            "SELECT 1 FROM watchlist_groups WHERE owner_id = ? LIMIT 1",
+            (owner_id,),
+        ).fetchone()
+        if row:
+            return
+        now = int(time.time())
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO watchlist_groups (owner_id, id, name, created_at, updated_at)
+            VALUES (?, 'default', '自选', ?, ?)
+            """,
+            (owner_id, now, now),
+        )
+
+    def _public_watchlist_owner_id() -> str:
+        required = os.environ.get("STOCK_SCREENER_API_KEY")
+        if required:
+            return sha256(required.encode("utf-8")).hexdigest()
+        return "public"
+
+    def _resolve_auto_screen_owner_id(conn: Any, *, user: AuthUser | None) -> str:
+        if user is not None:
+            return user.id
+        if app.state.app_state.auth_enabled:
+            row = conn.execute("SELECT screen_owner_id FROM auto_update_config WHERE id = 1 LIMIT 1").fetchone()
+            if row and row["screen_owner_id"]:
+                return str(row["screen_owner_id"])
+            row2 = conn.execute(
+                """
+                SELECT id
+                FROM users
+                WHERE role = 'admin'
+                  AND disabled = 0
+                ORDER BY created_at ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row2:
+                raise ValueError("no enabled admin user found for auto screen")
+            owner_id = str(row2["id"])
+            now = int(time.time())
+            conn.execute(
+                "UPDATE auto_update_config SET screen_owner_id = ?, updated_at = ? WHERE id = 1",
+                (owner_id, now),
+            )
+            return owner_id
+        return _public_watchlist_owner_id()
+
+    def _ensure_auto_screen_group(
+        conn: Any,
+        *,
+        owner_id: str,
+        group_name: str,
+        group_id: str | None,
+    ) -> str:
+        name = _normalize_watchlist_group_name(group_name) or "自动筛选"
+        now = int(time.time())
+
+        if group_id:
+            row = conn.execute(
+                "SELECT 1 FROM watchlist_groups WHERE owner_id = ? AND id = ? LIMIT 1",
+                (owner_id, group_id),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE watchlist_groups SET name = ?, updated_at = ? WHERE owner_id = ? AND id = ?",
+                    (name, now, owner_id, group_id),
+                )
+                return group_id
+
+        row2 = conn.execute(
+            """
+            SELECT id
+            FROM watchlist_groups
+            WHERE owner_id = ?
+              AND name = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (owner_id, name),
+        ).fetchone()
+        if row2 and row2["id"]:
+            gid = str(row2["id"])
+            conn.execute(
+                "UPDATE watchlist_groups SET updated_at = ? WHERE owner_id = ? AND id = ?",
+                (now, owner_id, gid),
+            )
+            return gid
+
+        gid = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO watchlist_groups (owner_id, id, name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (owner_id, gid, name, now, now),
+        )
+        return gid
+
     def _auto_update_loop(*, settings: Settings, stop_event: threading.Event) -> None:
         backend = _backend(settings)
         idle_sleep = 5.0
@@ -802,6 +953,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                                 (msg, now2),
                             )
                     else:
+                        latest: str | None = None
+                        should_auto_screen = False
                         with backend.connect() as conn:
                             now2 = int(time.time())
                             latests: list[str] = []
@@ -821,6 +974,47 @@ def create_app(*, settings: Settings) -> FastAPI:
                                 """,
                                 (now2, latest, now2),
                             )
+
+                            if latest:
+                                r2 = conn.execute(
+                                    """
+                                    SELECT screen_enabled, screen_last_trade_date
+                                    FROM auto_update_config
+                                    WHERE id = 1
+                                    LIMIT 1
+                                    """
+                                ).fetchone()
+                                if r2 and int(r2["screen_enabled"] or 0) == 1:
+                                    last_screened = str(r2["screen_last_trade_date"]) if r2["screen_last_trade_date"] else None
+                                    if last_screened != latest:
+                                        should_auto_screen = True
+
+                        if should_auto_screen and latest:
+                            try:
+                                _run_auto_screen_job(
+                                    settings=settings,
+                                    target_date=latest,
+                                    force=False,
+                                    require_enabled=True,
+                                    user=None,
+                                )
+                            except Exception as e:
+                                msg = (str(e) or "auto screen failed")[:2000]
+                                with backend.connect() as conn:
+                                    now3 = int(time.time())
+                                    conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                                    conn.execute(
+                                        """
+                                        UPDATE auto_update_config
+                                        SET screen_last_run_at = ?,
+                                            screen_last_trade_date = ?,
+                                            screen_last_count = ?,
+                                            screen_last_error = ?,
+                                            updated_at = ?
+                                        WHERE id = 1
+                                        """,
+                                        (now3, latest, 0, msg, now3),
+                                    )
                 finally:
                     update_lock.release()
 
@@ -1947,6 +2141,348 @@ def create_app(*, settings: Settings) -> FastAPI:
             )
         return get_auto_update_config(settings=settings)
 
+    def _auto_screen_config_from_row(row: Any) -> AutoScreenConfig:
+        combo = str(row["screen_combo"] or "and").strip().lower()
+        if combo not in {"and", "or"}:
+            combo = "and"
+
+        price_adjust = str(row["screen_price_adjust"] or "qfq").strip().lower()
+        if price_adjust not in {"none", "qfq", "hfq"}:
+            price_adjust = "qfq"
+
+        lookback_days = int(row["screen_lookback_days"] or 200)
+        if lookback_days < 0:
+            lookback_days = 200
+        if lookback_days > 20000:
+            lookback_days = 20000
+
+        group_name = _normalize_watchlist_group_name(str(row["screen_group_name"] or "自动筛选")) or "自动筛选"
+        rules_raw = row["screen_rules"]
+        rules = None
+        if rules_raw is not None and str(rules_raw).strip():
+            rules = str(rules_raw).strip()
+
+        return AutoScreenConfig(
+            enabled=bool(int(row["screen_enabled"] or 0)),
+            group_name=group_name,
+            group_id=str(row["screen_group_id"]) if row["screen_group_id"] else None,
+            combo=combo,  # type: ignore[arg-type]
+            rules=rules,
+            lookback_days=lookback_days,
+            with_name=bool(int(row["screen_with_name"] or 0)),
+            exclude_st=bool(int(row["screen_exclude_st"] or 0)),
+            price_adjust=price_adjust,  # type: ignore[arg-type]
+            replace_group=bool(int(row["screen_replace_group"] or 0)),
+            last_run_at=int(row["screen_last_run_at"]) if row["screen_last_run_at"] is not None else None,
+            last_trade_date=str(row["screen_last_trade_date"]) if row["screen_last_trade_date"] else None,
+            last_count=int(row["screen_last_count"]) if row["screen_last_count"] is not None else None,
+            last_error=str(row["screen_last_error"]) if row["screen_last_error"] else None,
+        )
+
+    @app.get("/auto-screen-config", response_model=AutoScreenConfig, dependencies=[Depends(_admin_required)])
+    def get_auto_screen_config(settings: Settings = Depends(_settings_dep)) -> AutoScreenConfig:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+            row = conn.execute(
+                """
+                SELECT
+                  screen_enabled, screen_combo, screen_rules, screen_lookback_days,
+                  screen_with_name, screen_exclude_st, screen_price_adjust,
+                  screen_group_name, screen_group_id, screen_replace_group,
+                  screen_last_run_at, screen_last_trade_date, screen_last_count, screen_last_error
+                FROM auto_update_config
+                WHERE id = 1
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="auto_update_config missing")
+        return _auto_screen_config_from_row(row)
+
+    @app.put("/auto-screen-config", response_model=AutoScreenConfig, dependencies=[Depends(_admin_required)])
+    def update_auto_screen_config(
+        req: AutoScreenConfigUpdate,
+        settings: Settings = Depends(_settings_dep),
+        user: AuthUser | None = Depends(_access_required),
+    ) -> AutoScreenConfig:
+        group_name = _normalize_watchlist_group_name(req.group_name)
+        if not group_name:
+            raise HTTPException(status_code=400, detail="group_name is required")
+
+        backend = _backend(settings)
+        try:
+            resolve_rules(req.rules, backend=backend)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        now = int(time.time())
+        with backend.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+
+            if user is not None and app.state.app_state.auth_enabled:
+                prev = conn.execute(
+                    "SELECT screen_owner_id FROM auto_update_config WHERE id = 1 LIMIT 1"
+                ).fetchone()
+                prev_owner_id = str(prev["screen_owner_id"]) if prev and prev["screen_owner_id"] else None
+                if prev_owner_id != user.id:
+                    conn.execute("UPDATE auto_update_config SET screen_group_id = NULL WHERE id = 1")
+                conn.execute("UPDATE auto_update_config SET screen_owner_id = ? WHERE id = 1", (user.id,))
+
+            conn.execute(
+                """
+                UPDATE auto_update_config
+                SET screen_enabled = ?,
+                    screen_combo = ?,
+                    screen_rules = ?,
+                    screen_lookback_days = ?,
+                    screen_with_name = ?,
+                    screen_exclude_st = ?,
+                    screen_price_adjust = ?,
+                    screen_group_name = ?,
+                    screen_replace_group = ?,
+                    screen_last_error = NULL,
+                    updated_at = ?
+                WHERE id = 1
+                """,
+                (
+                    1 if req.enabled else 0,
+                    req.combo,
+                    (req.rules.strip() if req.rules and req.rules.strip() else None),
+                    req.lookback_days,
+                    1 if req.with_name else 0,
+                    1 if req.exclude_st else 0,
+                    req.price_adjust,
+                    group_name,
+                    1 if req.replace_group else 0,
+                    now,
+                ),
+            )
+        return get_auto_screen_config(settings=settings)
+
+    def _run_auto_screen_job(
+        *,
+        settings: Settings,
+        target_date: str | None,
+        force: bool,
+        require_enabled: bool,
+        user: AuthUser | None,
+    ) -> AutoScreenRunResponse:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+            row = conn.execute(
+                """
+                SELECT
+                  screen_enabled, screen_combo, screen_rules, screen_lookback_days,
+                  screen_with_name, screen_exclude_st, screen_price_adjust,
+                  screen_owner_id, screen_group_name, screen_group_id, screen_replace_group,
+                  screen_last_trade_date, screen_last_count
+                FROM auto_update_config
+                WHERE id = 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=500, detail="auto_update_config missing")
+
+            enabled = bool(int(row["screen_enabled"] or 0))
+            if require_enabled and not enabled:
+                raise HTTPException(status_code=400, detail="auto screen is disabled")
+
+            owner_id = _resolve_auto_screen_owner_id(conn, user=user)
+            if user is not None and app.state.app_state.auth_enabled:
+                prev_owner_id = str(row["screen_owner_id"]) if row["screen_owner_id"] else None
+                if prev_owner_id != owner_id:
+                    conn.execute("UPDATE auto_update_config SET screen_group_id = NULL WHERE id = 1")
+                    row = dict(row)
+                    row["screen_group_id"] = None
+                conn.execute("UPDATE auto_update_config SET screen_owner_id = ? WHERE id = 1", (owner_id,))
+
+            combo = str(row["screen_combo"] or "and").strip().lower()
+            if combo not in {"and", "or"}:
+                combo = "and"
+            price_adjust = str(row["screen_price_adjust"] or "qfq").strip().lower()
+            if price_adjust not in {"none", "qfq", "hfq"}:
+                price_adjust = "qfq"
+            lookback_days = int(row["screen_lookback_days"] or 200)
+            if lookback_days < 0:
+                lookback_days = 200
+            rules = str(row["screen_rules"]).strip() if row["screen_rules"] and str(row["screen_rules"]).strip() else None
+            with_name = bool(int(row["screen_with_name"] or 0))
+            exclude_st = bool(int(row["screen_exclude_st"] or 0))
+            group_name = _normalize_watchlist_group_name(str(row["screen_group_name"] or "自动筛选")) or "自动筛选"
+            existing_group_id = str(row["screen_group_id"]) if row["screen_group_id"] else None
+            replace_group = bool(int(row["screen_replace_group"] or 0))
+            last_trade_date = str(row["screen_last_trade_date"]) if row["screen_last_trade_date"] else None
+            last_count = int(row["screen_last_count"]) if row["screen_last_count"] is not None else None
+
+        eff_settings = settings.model_copy(update={"price_adjust": price_adjust})
+        eff_backend = _backend(eff_settings)
+        if target_date is None or target_date == "latest":
+            max_daily = eff_backend.max_trade_date_in_daily()
+            if not max_daily:
+                raise HTTPException(status_code=400, detail="no local data; run update first")
+            trade_date = str(max_daily)
+        else:
+            trade_date = str(target_date)
+            try:
+                parse_yyyymmdd(trade_date)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+        if not force and last_trade_date == trade_date:
+            if existing_group_id is None:
+                with backend.connect() as conn:
+                    conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                    gid = _ensure_auto_screen_group(conn, owner_id=owner_id, group_name=group_name, group_id=None)
+                    now = int(time.time())
+                    conn.execute(
+                        "UPDATE auto_update_config SET screen_group_id = ?, updated_at = ? WHERE id = 1",
+                        (gid, now),
+                    )
+                existing_group_id = gid
+            return AutoScreenRunResponse(
+                ok=True,
+                trade_date=trade_date,
+                count=int(last_count or 0),
+                group_id=existing_group_id,
+                group_name=group_name,
+                message=f"skip: already screened for {trade_date}",
+            )
+
+        try:
+            df = run_screen(
+                settings=eff_settings,
+                date=trade_date,
+                combo=combo,  # type: ignore[arg-type]
+                lookback_days=lookback_days,
+                rules=rules,
+                with_name=with_name,
+                exclude_st=exclude_st,
+            )
+        except typer.BadParameter as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        hits: list[str] = []
+        if not df.empty and "ts_code" in df.columns:
+            seen: set[str] = set()
+            for v in df["ts_code"].astype(str).tolist():
+                code = v.strip().upper()
+                if not code or code in seen:
+                    continue
+                seen.add(code)
+                hits.append(code)
+
+        now = int(time.time())
+        with backend.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+
+            group_id = _ensure_auto_screen_group(conn, owner_id=owner_id, group_name=group_name, group_id=existing_group_id)
+            if replace_group:
+                conn.execute(
+                    "DELETE FROM watchlist_items WHERE owner_id = ? AND group_id = ?",
+                    (owner_id, group_id),
+                )
+
+            name_by_code: dict[str, str | None] = {}
+            if with_name and hits:
+                placeholders = ",".join(["?"] * len(hits))
+                rows = conn.execute(
+                    f"SELECT ts_code, name FROM stock_basic WHERE ts_code IN ({placeholders})",
+                    hits,
+                ).fetchall()
+                for r in rows:
+                    ts_code = str(r["ts_code"])
+                    name_by_code[ts_code] = str(r["name"]) if r["name"] else None
+
+            if hits:
+                conn.executemany(
+                    """
+                    INSERT INTO watchlist_items (owner_id, group_id, ts_code, name, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(owner_id, group_id, ts_code) DO UPDATE SET
+                      name = COALESCE(excluded.name, watchlist_items.name),
+                      updated_at = excluded.updated_at
+                    """,
+                    [
+                        (
+                            owner_id,
+                            group_id,
+                            ts_code,
+                            name_by_code.get(ts_code),
+                            now,
+                            now,
+                        )
+                        for ts_code in hits
+                    ],
+                )
+
+            conn.execute(
+                "UPDATE watchlist_groups SET updated_at = ? WHERE owner_id = ? AND id = ?",
+                (now, owner_id, group_id),
+            )
+
+            conn.execute(
+                """
+                UPDATE auto_update_config
+                SET screen_group_id = ?,
+                    screen_last_run_at = ?,
+                    screen_last_trade_date = ?,
+                    screen_last_count = ?,
+                    screen_last_error = NULL,
+                    updated_at = ?
+                WHERE id = 1
+                """,
+                (group_id, now, trade_date, len(hits), now),
+            )
+
+        return AutoScreenRunResponse(
+            ok=True,
+            trade_date=trade_date,
+            count=len(hits),
+            group_id=group_id,
+            group_name=group_name,
+            message=f"screened {len(hits)} stocks into '{group_name}'",
+        )
+
+    @app.post("/v1/auto-screen/run", response_model=AutoScreenRunResponse)
+    def run_auto_screen(
+        req: AutoScreenRunRequest,
+        settings: Settings = Depends(_settings_dep),
+        user: AuthUser | None = Depends(_admin_required),
+    ) -> AutoScreenRunResponse:
+        try:
+            return _run_auto_screen_job(
+                settings=settings,
+                target_date=req.date,
+                force=bool(req.force),
+                require_enabled=False,
+                user=user,
+            )
+        except HTTPException as e:
+            # Record failure for diagnostics; then bubble up for the UI to show.
+            backend = _backend(settings)
+            now = int(time.time())
+            msg = (str(e.detail) if isinstance(e.detail, str) else str(e.detail or "auto screen failed"))[:2000]
+            with backend.connect() as conn:
+                conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                conn.execute(
+                    """
+                    UPDATE auto_update_config
+                    SET screen_last_run_at = ?,
+                        screen_last_trade_date = ?,
+                        screen_last_count = ?,
+                        screen_last_error = ?,
+                        updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (now, None, 0, msg, now),
+                )
+            raise
+
     @app.post("/v1/update", dependencies=[Depends(_admin_required)])
     def update(req: UpdateRequest, settings: Settings = Depends(_settings_dep)) -> dict[str, Any]:
         try:
@@ -2638,25 +3174,6 @@ def create_app(*, settings: Settings) -> FastAPI:
             return {"ok": True, "synced": len(basics_df), "message": f"synced {len(basics_df)} stock names"}
 
     # Watchlist endpoints (groups + items)
-
-    def _normalize_watchlist_group_name(name: str) -> str:
-        return re.sub(r"\s+", " ", name.strip())[:30]
-
-    def _ensure_default_watchlist_group(conn: Any, owner_id: str) -> None:
-        row = conn.execute(
-            "SELECT 1 FROM watchlist_groups WHERE owner_id = ? LIMIT 1",
-            (owner_id,),
-        ).fetchone()
-        if row:
-            return
-        now = int(time.time())
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO watchlist_groups (owner_id, id, name, created_at, updated_at)
-            VALUES (?, 'default', '自选', ?, ?)
-            """,
-            (owner_id, now, now),
-        )
 
     @app.get(
         "/v1/watchlist",

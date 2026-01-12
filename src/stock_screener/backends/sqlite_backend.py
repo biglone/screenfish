@@ -185,6 +185,26 @@ class SqliteBackend:
                   interval_seconds INTEGER NOT NULL DEFAULT 600,
                   provider TEXT NOT NULL DEFAULT 'baostock',
                   repair_days INTEGER NOT NULL DEFAULT 30,
+
+                  -- Optional: auto screen settings (run after successful auto update)
+                  screen_enabled INTEGER NOT NULL DEFAULT 0,
+                  screen_combo TEXT NOT NULL DEFAULT 'and',
+                  screen_rules TEXT,
+                  screen_lookback_days INTEGER NOT NULL DEFAULT 200,
+                  screen_with_name INTEGER NOT NULL DEFAULT 0,
+                  screen_exclude_st INTEGER NOT NULL DEFAULT 0,
+                  screen_price_adjust TEXT NOT NULL DEFAULT 'qfq',
+                  screen_owner_id TEXT,
+                  screen_group_name TEXT NOT NULL DEFAULT '自动筛选',
+                  screen_group_id TEXT,
+                  screen_replace_group INTEGER NOT NULL DEFAULT 1,
+
+                  -- Auto screen runtime status
+                  screen_last_run_at INTEGER,
+                  screen_last_trade_date TEXT,
+                  screen_last_count INTEGER,
+                  screen_last_error TEXT,
+
                   last_run_at INTEGER,
                   last_success_at INTEGER,
                   last_success_trade_date TEXT,
@@ -293,6 +313,38 @@ class SqliteBackend:
             conn.execute("ALTER TABLE auto_update_config ADD COLUMN last_error TEXT")
         if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "updated_at"):
             conn.execute("ALTER TABLE auto_update_config ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
+
+        # auto_update_config: auto screen settings + status columns.
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_enabled"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_enabled INTEGER NOT NULL DEFAULT 0")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_combo"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_combo TEXT NOT NULL DEFAULT 'and'")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_rules"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_rules TEXT")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_lookback_days"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_lookback_days INTEGER NOT NULL DEFAULT 200")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_with_name"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_with_name INTEGER NOT NULL DEFAULT 0")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_exclude_st"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_exclude_st INTEGER NOT NULL DEFAULT 0")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_price_adjust"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_price_adjust TEXT NOT NULL DEFAULT 'qfq'")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_owner_id"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_owner_id TEXT")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_group_name"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_group_name TEXT NOT NULL DEFAULT '自动筛选'")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_group_id"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_group_id TEXT")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_replace_group"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_replace_group INTEGER NOT NULL DEFAULT 1")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_last_run_at"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_last_run_at INTEGER")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_last_trade_date"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_last_trade_date TEXT")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_last_count"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_last_count INTEGER")
+        if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_last_error"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_last_error TEXT")
 
         try:
             from stock_screener.pinyin import pinyin_full as _pinyin_full
