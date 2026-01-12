@@ -164,6 +164,167 @@ def test_list_trade_dates_uses_update_log(tmp_path: Path) -> None:
     assert body["dates"] == ["20240131"]
 
 
+def test_stock_daily_filters_no_trade_bars(tmp_path: Path) -> None:
+    settings = Settings(cache_dir=tmp_path, data_backend="sqlite", price_adjust="qfq")
+    backend = SqliteBackend(
+        settings.sqlite_path,
+        daily_table=settings.daily_table,
+        update_log_table=settings.update_log_table,
+        provider_stock_progress_table=settings.provider_stock_progress_table,
+    )
+    backend.init()
+    backend.upsert_stock_basic_df(pd.DataFrame([{"ts_code": "000001.SZ", "name": "平安银行"}]))
+
+    backend.upsert_daily_df(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240101",
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240102",
+                    "open": 100.0,
+                    "high": 100.0,
+                    "low": 100.0,
+                    "close": 100.0,
+                    "vol": None,
+                    "amount": None,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240103",
+                    "open": 2.0,
+                    "high": 2.0,
+                    "low": 2.0,
+                    "close": 2.0,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240104",
+                    "open": 3.0,
+                    "high": 3.0,
+                    "low": 3.0,
+                    "close": 3.0,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240105",
+                    "open": 999.0,
+                    "high": 999.0,
+                    "low": 999.0,
+                    "close": 999.0,
+                    "vol": 0.0,
+                    "amount": 0.0,
+                },
+            ]
+        )
+    )
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.get("/v1/stocks/000001.SZ/daily", params={"price_adjust": "qfq", "limit": 100})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ts_code"] == "000001.SZ"
+    assert body["name"] == "平安银行"
+    assert [b["trade_date"] for b in body["bars"]] == ["20240101", "20240103", "20240104"]
+
+
+def test_indicator_series_filters_no_trade_bars(tmp_path: Path) -> None:
+    settings = Settings(cache_dir=tmp_path, data_backend="sqlite", price_adjust="qfq")
+    backend = SqliteBackend(
+        settings.sqlite_path,
+        daily_table=settings.daily_table,
+        update_log_table=settings.update_log_table,
+        provider_stock_progress_table=settings.provider_stock_progress_table,
+    )
+    backend.init()
+
+    backend.upsert_daily_df(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240101",
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240102",
+                    "open": 100.0,
+                    "high": 100.0,
+                    "low": 100.0,
+                    "close": 100.0,
+                    "vol": None,
+                    "amount": None,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240103",
+                    "open": 2.0,
+                    "high": 2.0,
+                    "low": 2.0,
+                    "close": 2.0,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240104",
+                    "open": 3.0,
+                    "high": 3.0,
+                    "low": 3.0,
+                    "close": 3.0,
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240105",
+                    "open": 999.0,
+                    "high": 999.0,
+                    "low": 999.0,
+                    "close": 999.0,
+                    "vol": 0.0,
+                    "amount": 0.0,
+                },
+            ]
+        )
+    )
+
+    f = backend.create_formula(name="ma3_test", formula="X:MA(CLOSE,3);", kind="indicator", enabled=True)
+    formula_id = int(f["id"])
+
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
+    r = client.get(f"/v1/stocks/000001.SZ/indicators/{formula_id}", params={"price_adjust": "qfq", "limit": 100})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ts_code"] == "000001.SZ"
+    assert body["formula_id"] == formula_id
+    assert [p["trade_date"] for p in body["points"]] == ["20240101", "20240103", "20240104"]
+    assert body["points"][-1]["value"] == 2.0
+
+
 def test_auto_update_config_defaults_and_update(tmp_path: Path) -> None:
     settings = _seed_sqlite(tmp_path)
     app = create_app(settings=settings)

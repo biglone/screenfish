@@ -2577,14 +2577,17 @@ def create_app(*, settings: Settings) -> FastAPI:
                 high,
                 low,
                 close,
-                COALESCE(vol, 0) as vol,
-                COALESCE(amount, 0) as amount
+                vol,
+                amount
             FROM {backend.daily_table}
             WHERE ts_code = ?
               AND open IS NOT NULL
               AND high IS NOT NULL
               AND low IS NOT NULL
               AND close IS NOT NULL
+              AND vol IS NOT NULL
+              AND amount IS NOT NULL
+              AND NOT (vol = 0 AND amount = 0)
             """
             params: list[Any] = [ts_code]
             if start:
@@ -3148,14 +3151,17 @@ def create_app(*, settings: Settings) -> FastAPI:
                 high,
                 low,
                 close,
-                COALESCE(vol, 0) as vol,
-                COALESCE(amount, 0) as amount
+                vol,
+                amount
             FROM {backend.daily_table}
             WHERE ts_code = ?
               AND open IS NOT NULL
               AND high IS NOT NULL
               AND low IS NOT NULL
               AND close IS NOT NULL
+              AND vol IS NOT NULL
+              AND amount IS NOT NULL
+              AND NOT (vol = 0 AND amount = 0)
             """
             params: list[Any] = [ts_code]
             if start:
