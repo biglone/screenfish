@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import statistics
 import subprocess
@@ -179,29 +180,46 @@ def probe_baostock_daily_available(*, trade_date: str) -> tuple[bool, str]:
     except ModuleNotFoundError:
         return False, "baostock not installed"
 
-    lg = bs.login()
-    if getattr(lg, "error_code", "0") != "0":
-        return False, f"login failed: {getattr(lg, 'error_msg', '')}"
-
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30.0)
     try:
-        iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
-        samples = ["sh.600000", "sz.000001"]
-        for code in samples:
-            rs = bs.query_history_k_data_plus(
-                code,
-                "date,code,close",
-                start_date=iso,
-                end_date=iso,
-                frequency="d",
-                adjustflag="3",
-            )
-            if rs is None or getattr(rs, "error_code", "0") != "0":
-                continue
-            if rs.next():
-                return True, f"sample ok: {code}"
-        return False, "no sample rows yet"
+        try:
+            lg = bs.login()
+        except Exception as e:
+            return False, f"login failed: {e}"
+        if getattr(lg, "error_code", "0") != "0":
+            return False, f"login failed: {getattr(lg, 'error_msg', '')}"
+
+        try:
+            iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+            samples = ["sh.600000", "sz.000001"]
+            for code in samples:
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        code,
+                        "date,code,close",
+                        start_date=iso,
+                        end_date=iso,
+                        frequency="d",
+                        adjustflag="3",
+                    )
+                except Exception:
+                    continue
+                if rs is None or getattr(rs, "error_code", "0") != "0":
+                    continue
+                try:
+                    if rs.next():
+                        return True, f"sample ok: {code}"
+                except Exception:
+                    continue
+            return False, "no sample rows yet"
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
     finally:
-        bs.logout()
+        socket.setdefaulttimeout(prev_timeout)
 
 
 def _watchlist_owner_id(x_api_key: str | None = Header(default=None)) -> str:
@@ -904,6 +922,34 @@ def create_app(*, settings: Settings) -> FastAPI:
                     stop_event.wait(min(idle_sleep, float(due_in)))
                     continue
 
+                requested = format_yyyymmdd(_date.today())
+                target_end: str | None = None
+                try:
+                    target_end = resolve_wait_target_trade_date(provider=provider, target_date=requested)
+                except Exception as e:
+                    msg = (str(e) or "failed to resolve target trade date")[:2000]
+                    now2 = int(time.time())
+                    with backend.connect() as conn:
+                        conn.execute(
+                            "UPDATE auto_update_config SET last_run_at = ?, last_error = ?, updated_at = ? WHERE id = 1",
+                            (now2, msg, now2),
+                        )
+                    stop_event.wait(idle_sleep)
+                    continue
+
+                if provider == "baostock" and target_end:
+                    ok_remote, detail = probe_baostock_daily_available(trade_date=target_end)
+                    if not ok_remote:
+                        msg = f"waiting for provider publish ({detail})"[:2000]
+                        now2 = int(time.time())
+                        with backend.connect() as conn:
+                            conn.execute(
+                                "UPDATE auto_update_config SET last_run_at = ?, last_error = ?, updated_at = ? WHERE id = 1",
+                                (now2, msg, now2),
+                            )
+                        stop_event.wait(idle_sleep)
+                        continue
+
                 if not update_lock.acquire(timeout=1.0):
                     stop_event.wait(idle_sleep)
                     continue
@@ -924,7 +970,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                         update_daily_all_service(
                             settings=settings,
                             start=None,
-                            end=None,
+                            end=target_end,
                             provider=provider,
                             repair_days=repair_days,
                         )

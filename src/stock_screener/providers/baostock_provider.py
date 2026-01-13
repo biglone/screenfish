@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import socket
 import time
 from typing import Iterable
 
@@ -12,6 +13,16 @@ from stock_screener.dates import parse_yyyymmdd
 
 class BaoStockNotConfigured(RuntimeError):
     pass
+
+
+@contextmanager
+def _default_socket_timeout(seconds: float):
+    prev = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(prev)
 
 
 def _to_iso(yyyymmdd: str) -> str:
@@ -37,6 +48,7 @@ def bs_to_ts_code(bs_code: str) -> str:
 class BaoStockProvider:
     name: str = "baostock"
     adjustflag: str = "3"
+    timeout_seconds: float = 30.0
 
     def _bs(self):
         try:
@@ -64,16 +76,23 @@ class BaoStockProvider:
     @contextmanager
     def session(self):
         bs = self._bs()
-        lg = bs.login()
-        if getattr(lg, "error_code", "0") != "0":  # pragma: no cover
-            raise RuntimeError(f"baostock login failed: {lg.error_msg}")
-        try:
-            yield bs
-        finally:
-            bs.logout()
+        with _default_socket_timeout(float(self.timeout_seconds or 30.0)):
+            lg = bs.login()
+            if getattr(lg, "error_code", "0") != "0":  # pragma: no cover
+                raise RuntimeError(f"baostock login failed: {lg.error_msg}")
+            try:
+                yield bs
+            finally:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
 
     def _open_trade_dates(self, *, bs, start: str, end: str) -> list[str]:
-        rs = bs.query_trade_dates(start_date=_to_iso(start), end_date=_to_iso(end))
+        try:
+            rs = bs.query_trade_dates(start_date=_to_iso(start), end_date=_to_iso(end))
+        except Exception as e:
+            raise RuntimeError(f"baostock query_trade_dates failed: {e}") from e
         if rs.error_code != "0":  # pragma: no cover
             raise RuntimeError(f"baostock query_trade_dates failed: {rs.error_msg}")
 
@@ -93,7 +112,10 @@ class BaoStockProvider:
     def _all_stock_codes(self, *, bs, day: str) -> list[str]:
         # Use stock_basic so we only pull A-share stocks (type=1), including delisted ones.
         # query_all_stock(day=...) contains ETFs/indices and misses delisted stocks.
-        rs = bs.query_stock_basic()
+        try:
+            rs = bs.query_stock_basic()
+        except Exception as e:
+            raise RuntimeError(f"baostock query_stock_basic failed: {e}") from e
         if rs.error_code != "0":  # pragma: no cover
             raise RuntimeError(f"baostock query_stock_basic failed: {rs.error_msg}")
         codes = []
@@ -108,7 +130,10 @@ class BaoStockProvider:
         return codes
 
     def _all_stock_basics(self, *, bs, day: str) -> pd.DataFrame:
-        rs = bs.query_all_stock(day=_to_iso(day))
+        try:
+            rs = bs.query_all_stock(day=_to_iso(day))
+        except Exception as e:
+            raise RuntimeError(f"baostock query_all_stock failed: {e}") from e
         if rs.error_code != "0":  # pragma: no cover
             raise RuntimeError(f"baostock query_all_stock failed: {rs.error_msg}")
         rows = []
@@ -147,14 +172,20 @@ class BaoStockProvider:
             last_err = None
             need_retry = False
             for start, end in ranges:
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "date,code,open,high,low,close,volume,amount",
-                    start_date=_to_iso(start),
-                    end_date=_to_iso(end),
-                    frequency="d",
-                    adjustflag=str(self.adjustflag or "3"),
-                )
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,code,open,high,low,close,volume,amount",
+                        start_date=_to_iso(start),
+                        end_date=_to_iso(end),
+                        frequency="d",
+                        adjustflag=str(self.adjustflag or "3"),
+                    )
+                except Exception as e:
+                    last_err = str(e) or e.__class__.__name__
+                    parts = []
+                    need_retry = True
+                    break
                 if rs is None:  # pragma: no cover
                     last_err = "baostock returned None resultset"
                     parts = []
@@ -167,8 +198,14 @@ class BaoStockProvider:
                     need_retry = True
                     break
                 rows = []
-                while rs.next():
-                    rows.append(rs.get_row_data())
+                try:
+                    while rs.next():
+                        rows.append(rs.get_row_data())
+                except Exception as e:
+                    last_err = str(e) or e.__class__.__name__
+                    parts = []
+                    need_retry = True
+                    break
                 if not rows:
                     continue
                 df = pd.DataFrame(rows, columns=rs.fields)
