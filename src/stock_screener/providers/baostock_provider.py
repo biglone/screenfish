@@ -60,8 +60,21 @@ class BaoStockProvider:
     def _relogin_if_needed(self, *, bs, err_msg: str | None) -> None:
         if not err_msg:
             return
-        # BaoStock sometimes drops the session and returns "用户未登录".
-        if "用户未登录" not in err_msg and "尚未登录" not in err_msg:
+        msg = str(err_msg)
+        # BaoStock sometimes drops the session and returns "用户未登录". It may also
+        # end up with broken sockets ("Bad file descriptor", "网络接收错误").
+        if not any(
+            k in msg
+            for k in (
+                "用户未登录",
+                "尚未登录",
+                "网络接收错误",
+                "接收数据异常",
+                "Bad file descriptor",
+                "Connection reset",
+                "Broken pipe",
+            )
+        ):
             return
         try:
             if hasattr(bs, "logout"):
@@ -183,6 +196,7 @@ class BaoStockProvider:
                     )
                 except Exception as e:
                     last_err = str(e) or e.__class__.__name__
+                    self._relogin_if_needed(bs=bs, err_msg=last_err)
                     parts = []
                     need_retry = True
                     break
@@ -203,6 +217,7 @@ class BaoStockProvider:
                         rows.append(rs.get_row_data())
                 except Exception as e:
                     last_err = str(e) or e.__class__.__name__
+                    self._relogin_if_needed(bs=bs, err_msg=last_err)
                     parts = []
                     need_retry = True
                     break

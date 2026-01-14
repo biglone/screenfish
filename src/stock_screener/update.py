@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date as _date
 import sqlite3
+import time
 from typing import Callable
 
 import pandas as pd
@@ -266,31 +267,40 @@ def update_daily_service(
                             ts_code=ts_code,
                         )
                 done = set(seed)
-        resume_msg = (
-            f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done & target_ts_codes)}"
-        )
-        typer.echo(resume_msg)
-        if progress_cb is not None:
+        total = len(target_ts_codes)
+        completed = len(done & target_ts_codes)
+
+        last_progress_emit = 0.0
+
+        def _emit_progress(msg: str, *, force: bool = False) -> None:
+            nonlocal last_progress_emit
+            if progress_cb is None:
+                return
+            now = time.monotonic()
+            if not force and now - last_progress_emit < 2.0:
+                return
+            last_progress_emit = now
             try:
-                progress_cb(resume_msg)
+                progress_cb(msg)
             except Exception:
                 pass
+
+        resume_msg = f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {completed}"
+        typer.echo(resume_msg)
+        _emit_progress(resume_msg, force=True)
 
         batches = _batched(codes, batch_size=200)
         for bi, batch in enumerate(batches, start=1):
             batch_msg = f"batch: {bi}/{len(batches)}"
             typer.echo(batch_msg)
-            if progress_cb is not None:
-                try:
-                    progress_cb(batch_msg)
-                except Exception:
-                    pass
+            _emit_progress(batch_msg, force=True)
             with p.session() as bs:
                 with backend.connect() as conn:
                     for code in batch:
                         ts_code = bs_to_ts_code(code)
                         if ts_code in done:
                             continue
+                        _emit_progress(f"processing: {ts_code} ({completed}/{total})")
                         try:
                             df = p._fetch_daily_ranges(bs=bs, bs_code=code, ranges=ranges)
                         except RuntimeError as e:
@@ -306,6 +316,9 @@ def update_daily_service(
                             )
                             conn.commit()
                             done.add(ts_code)
+                            if ts_code in target_ts_codes:
+                                completed += 1
+                            _emit_progress(f"progress: {completed}/{total}")
                             continue
                         backend.upsert_daily_df_in_conn(conn, df)
                         backend.mark_progress_ts_code_in_conn(
@@ -317,14 +330,11 @@ def update_daily_service(
                         )
                         conn.commit()
                         done.add(ts_code)
+                        if ts_code in target_ts_codes:
+                            completed += 1
+                        _emit_progress(f"progress: {completed}/{total}")
 
-            if progress_cb is not None:
-                try:
-                    completed = len(done & target_ts_codes)
-                    total = len(target_ts_codes)
-                    progress_cb(f"progress: {completed}/{total}")
-                except Exception:
-                    pass
+            _emit_progress(f"progress: {completed}/{total}", force=True)
 
         progress = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
         completed = len(progress & target_ts_codes)

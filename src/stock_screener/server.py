@@ -1301,6 +1301,17 @@ def create_app(*, settings: Settings) -> FastAPI:
 
         def _progress_cb(mode: Literal["none", "qfq", "hfq"], msg: str) -> None:
             raw = (str(msg or "").strip() or "")[:2000]
+            prev_mode_progress: float | None = None
+            prev_completed: int | None = None
+            prev_total: int | None = None
+            with update_wait_jobs_lock:
+                job = update_wait_jobs.get(job_id)
+                if job is None or job.status != "running":
+                    return
+                prev_mode_progress = job.mode_progress
+                prev_completed = job.mode_completed
+                prev_total = job.mode_total
+
             completed: int | None = None
             total: int | None = None
             m = progress_re.search(raw)
@@ -1313,6 +1324,11 @@ def create_app(*, settings: Settings) -> FastAPI:
                     total = int(m2.group(1))
                     completed = int(m2.group(2))
 
+            if completed is None:
+                completed = prev_completed
+            if total is None:
+                total = prev_total
+
             mode_prog: float | None = None
             if total is not None and total > 0 and completed is not None:
                 mode_prog = min(1.0, max(0.0, float(completed) / float(total)))
@@ -1323,6 +1339,9 @@ def create_app(*, settings: Settings) -> FastAPI:
                     tot = int(m3.group(2))
                     if tot > 0:
                         mode_prog = min(1.0, max(0.0, float(cur - 1) / float(tot)))
+
+            if mode_prog is None:
+                mode_prog = prev_mode_progress
 
             overall: float | None = None
             if mode_prog is not None:
