@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date as _date
 import sqlite3
+from typing import Callable
 
 import pandas as pd
 import typer
@@ -87,7 +88,15 @@ def _resolve_start_end(
     return start_eff, end_eff
 
 
-def update_daily_service(*, settings: Settings, start: str | None, end: str | None, provider: str, repair_days: int) -> None:
+def update_daily_service(
+    *,
+    settings: Settings,
+    start: str | None,
+    end: str | None,
+    provider: str,
+    repair_days: int,
+    progress_cb: Callable[[str], None] | None = None,
+) -> None:
     if settings.data_backend != "sqlite":
         raise UpdateBadRequest("only sqlite backend is implemented")
 
@@ -257,11 +266,25 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
                             ts_code=ts_code,
                         )
                 done = set(seed)
-        typer.echo(f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done & target_ts_codes)}")
+        resume_msg = (
+            f"stocks: {len(codes)}, range: {range_start}..{range_end}, resume_done: {len(done & target_ts_codes)}"
+        )
+        typer.echo(resume_msg)
+        if progress_cb is not None:
+            try:
+                progress_cb(resume_msg)
+            except Exception:
+                pass
 
         batches = _batched(codes, batch_size=200)
         for bi, batch in enumerate(batches, start=1):
-            typer.echo(f"batch: {bi}/{len(batches)}")
+            batch_msg = f"batch: {bi}/{len(batches)}"
+            typer.echo(batch_msg)
+            if progress_cb is not None:
+                try:
+                    progress_cb(batch_msg)
+                except Exception:
+                    pass
             with p.session() as bs:
                 with backend.connect() as conn:
                     for code in batch:
@@ -282,6 +305,7 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
                                 ts_code=ts_code,
                             )
                             conn.commit()
+                            done.add(ts_code)
                             continue
                         backend.upsert_daily_df_in_conn(conn, df)
                         backend.mark_progress_ts_code_in_conn(
@@ -293,6 +317,14 @@ def update_daily_service(*, settings: Settings, start: str | None, end: str | No
                         )
                         conn.commit()
                         done.add(ts_code)
+
+            if progress_cb is not None:
+                try:
+                    completed = len(done & target_ts_codes)
+                    total = len(target_ts_codes)
+                    progress_cb(f"progress: {completed}/{total}")
+                except Exception:
+                    pass
 
         progress = backend.get_progress_ts_codes(provider=provider_name, range_start=range_start, range_end=range_end)
         completed = len(progress & target_ts_codes)

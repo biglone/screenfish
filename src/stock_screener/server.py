@@ -60,7 +60,7 @@ from stock_screener.runner import run_screen
 from stock_screener.tdx import TdxEbkFormat, ts_code_to_ebk_code
 from stock_screener.tushare_client import TuShareNotConfigured
 from stock_screener.update import UpdateBadRequest, UpdateIncomplete, UpdateNotConfigured
-from stock_screener.update import update_daily_all_service
+from stock_screener.update import update_daily_all_service, update_daily_service
 
 
 def _client_ip(request: Request) -> str | None:
@@ -272,12 +272,25 @@ class UpdateWaitResponse(BaseModel):
     message: str
     last_error: str | None = None
 
+    mode: Literal["none", "qfq", "hfq"] | None = None
+    mode_progress: float | None = None
+    mode_completed: int | None = None
+    mode_total: int | None = None
+    progress: float | None = None
+
 
 class AutoUpdateConfig(BaseModel):
     enabled: bool = False
     interval_seconds: int = Field(default=600, ge=1)
     provider: Literal["baostock", "tushare"] = "baostock"
     repair_days: int = Field(default=30, ge=0)
+
+    run_status: Literal["idle", "running"] = "idle"
+    run_started_at: int | None = None
+    run_target_trade_date: str | None = None
+    run_mode: Literal["none", "qfq", "hfq"] | None = None
+    run_message: str | None = None
+
     last_run_at: int | None = None
     last_success_at: int | None = None
     last_success_trade_date: str | None = None
@@ -654,6 +667,13 @@ class _UpdateWaitJob:
     latest_trade_date: str | None = None
     message: str = "job started"
     last_error: str | None = None
+
+    mode: Literal["none", "qfq", "hfq"] | None = None
+    mode_progress: float | None = None
+    mode_completed: int | None = None
+    mode_total: int | None = None
+    progress: float | None = None
+
     finished_at: float | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
@@ -877,6 +897,32 @@ def create_app(*, settings: Settings) -> FastAPI:
         backend = _backend(settings)
         idle_sleep = 5.0
 
+        # If the process was restarted mid-run, the "running" marker can get stuck.
+        # Clear it on startup so the UI doesn't show a phantom running task forever.
+        try:
+            with backend.connect() as conn:
+                conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                row0 = conn.execute(
+                    "SELECT run_status FROM auto_update_config WHERE id = 1 LIMIT 1",
+                ).fetchone()
+                if row0 and str(row0["run_status"] or "").strip().lower() == "running":
+                    now0 = int(time.time())
+                    conn.execute(
+                        """
+                        UPDATE auto_update_config
+                        SET run_status = 'idle',
+                            run_message = 'previous auto update interrupted (service restarted)',
+                            updated_at = ?
+                        WHERE id = 1
+                        """,
+                        (now0,),
+                    )
+        except sqlite3.OperationalError:
+            # Older DBs will be migrated on init; ignore best-effort cleanup failures.
+            pass
+        except Exception:
+            pass
+
         while not stop_event.is_set():
             try:
                 with backend.connect() as conn:
@@ -960,26 +1006,81 @@ def create_app(*, settings: Settings) -> FastAPI:
                         conn.execute(
                             """
                             UPDATE auto_update_config
-                            SET last_run_at = ?, last_error = NULL, updated_at = ?
+                            SET last_run_at = ?,
+                                last_error = NULL,
+                                run_status = 'running',
+                                run_started_at = ?,
+                                run_target_trade_date = ?,
+                                run_mode = NULL,
+                                run_message = 'starting',
+                                updated_at = ?
                             WHERE id = 1
                             """,
-                            (run_started_at, run_started_at),
+                            (run_started_at, run_started_at, target_end, run_started_at),
                         )
 
                     try:
-                        update_daily_all_service(
-                            settings=settings,
-                            start=None,
-                            end=target_end,
-                            provider=provider,
-                            repair_days=repair_days,
-                        )
+                        errors_bad: dict[str, str] = {}
+                        errors_incomplete: dict[str, str] = {}
+
+                        def _run_progress(mode: str, message: str) -> None:
+                            nowp = int(time.time())
+                            msg = (str(message or "").strip() or None)
+                            if msg is not None:
+                                msg = msg[:2000]
+                            with backend.connect() as conn:
+                                conn.execute(
+                                    """
+                                    UPDATE auto_update_config
+                                    SET run_mode = ?,
+                                        run_message = ?,
+                                        updated_at = ?
+                                    WHERE id = 1
+                                    """,
+                                    (mode, msg, nowp),
+                                )
+
+                        for mode in ("none", "qfq", "hfq"):
+                            _run_progress(mode, f"updating {mode}")
+                            mode_settings = settings.model_copy(update={"price_adjust": mode})
+                            try:
+                                update_daily_service(
+                                    settings=mode_settings,
+                                    start=None,
+                                    end=target_end,
+                                    provider=provider,
+                                    repair_days=repair_days,
+                                    progress_cb=lambda m, _mode=mode: _run_progress(_mode, m),
+                                )
+                            except UpdateNotConfigured:
+                                raise
+                            except UpdateBadRequest as e:
+                                errors_bad[mode] = str(e)
+                            except UpdateIncomplete as e:
+                                errors_incomplete[mode] = str(e)
+
+                        if errors_bad:
+                            msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_bad.items())])
+                            raise UpdateBadRequest(msg)
+                        if errors_incomplete:
+                            msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_incomplete.items())])
+                            raise UpdateIncomplete(msg)
                     except UpdateIncomplete as e:
                         msg = (str(e) or "update incomplete")[:2000]
                         with backend.connect() as conn:
                             now2 = int(time.time())
                             conn.execute(
-                                "UPDATE auto_update_config SET last_error = ?, updated_at = ? WHERE id = 1",
+                                """
+                                UPDATE auto_update_config
+                                SET last_error = ?,
+                                    run_status = 'idle',
+                                    run_started_at = NULL,
+                                    run_target_trade_date = NULL,
+                                    run_mode = NULL,
+                                    run_message = NULL,
+                                    updated_at = ?
+                                WHERE id = 1
+                                """,
                                 (msg, now2),
                             )
                     except (UpdateBadRequest, UpdateNotConfigured) as e:
@@ -987,7 +1088,17 @@ def create_app(*, settings: Settings) -> FastAPI:
                         with backend.connect() as conn:
                             now2 = int(time.time())
                             conn.execute(
-                                "UPDATE auto_update_config SET last_error = ?, updated_at = ? WHERE id = 1",
+                                """
+                                UPDATE auto_update_config
+                                SET last_error = ?,
+                                    run_status = 'idle',
+                                    run_started_at = NULL,
+                                    run_target_trade_date = NULL,
+                                    run_mode = NULL,
+                                    run_message = NULL,
+                                    updated_at = ?
+                                WHERE id = 1
+                                """,
                                 (msg, now2),
                             )
                     except Exception as e:
@@ -995,7 +1106,17 @@ def create_app(*, settings: Settings) -> FastAPI:
                         with backend.connect() as conn:
                             now2 = int(time.time())
                             conn.execute(
-                                "UPDATE auto_update_config SET last_error = ?, updated_at = ? WHERE id = 1",
+                                """
+                                UPDATE auto_update_config
+                                SET last_error = ?,
+                                    run_status = 'idle',
+                                    run_started_at = NULL,
+                                    run_target_trade_date = NULL,
+                                    run_mode = NULL,
+                                    run_message = NULL,
+                                    updated_at = ?
+                                WHERE id = 1
+                                """,
                                 (msg, now2),
                             )
                     else:
@@ -1015,7 +1136,15 @@ def create_app(*, settings: Settings) -> FastAPI:
                             conn.execute(
                                 """
                                 UPDATE auto_update_config
-                                SET last_success_at = ?, last_success_trade_date = ?, last_error = NULL, updated_at = ?
+                                SET last_success_at = ?,
+                                    last_success_trade_date = ?,
+                                    last_error = NULL,
+                                    run_status = 'idle',
+                                    run_started_at = NULL,
+                                    run_target_trade_date = NULL,
+                                    run_mode = NULL,
+                                    run_message = NULL,
+                                    updated_at = ?
                                 WHERE id = 1
                                 """,
                                 (now2, latest, now2),
@@ -1101,6 +1230,11 @@ def create_app(*, settings: Settings) -> FastAPI:
             elapsed_seconds=elapsed,
             message=job.message,
             last_error=job.last_error,
+            mode=job.mode,
+            mode_progress=job.mode_progress,
+            mode_completed=job.mode_completed,
+            mode_total=job.mode_total,
+            progress=job.progress,
         )
 
     def _run_update_wait_job(*, job_id: str, settings: Settings) -> None:
@@ -1137,6 +1271,72 @@ def create_app(*, settings: Settings) -> FastAPI:
 
             latest = max(latests) if latests else None
             return ready, latest
+
+        mode_order: tuple[Literal["none", "qfq", "hfq"], ...] = ("none", "qfq", "hfq")
+        mode_index = {m: i for i, m in enumerate(mode_order)}
+        progress_re = re.compile(r"\bprogress:\s*(\d+)\s*/\s*(\d+)\b")
+        resume_re = re.compile(r"\bstocks:\s*(\d+).*\bresume_done:\s*(\d+)\b")
+        batch_re = re.compile(r"\bbatch:\s*(\d+)\s*/\s*(\d+)\b")
+
+        def _set_job_state(
+            *,
+            mode: Literal["none", "qfq", "hfq"] | None,
+            mode_progress: float | None,
+            mode_completed: int | None,
+            mode_total: int | None,
+            progress: float | None,
+            message: str | None = None,
+        ) -> None:
+            with update_wait_jobs_lock:
+                job = update_wait_jobs.get(job_id)
+                if job is None or job.status != "running":
+                    return
+                job.mode = mode
+                job.mode_progress = mode_progress
+                job.mode_completed = mode_completed
+                job.mode_total = mode_total
+                job.progress = progress
+                if message is not None:
+                    job.message = (message or "").strip()[:2000] or job.message
+
+        def _progress_cb(mode: Literal["none", "qfq", "hfq"], msg: str) -> None:
+            raw = (str(msg or "").strip() or "")[:2000]
+            completed: int | None = None
+            total: int | None = None
+            m = progress_re.search(raw)
+            if m:
+                completed = int(m.group(1))
+                total = int(m.group(2))
+            else:
+                m2 = resume_re.search(raw)
+                if m2:
+                    total = int(m2.group(1))
+                    completed = int(m2.group(2))
+
+            mode_prog: float | None = None
+            if total is not None and total > 0 and completed is not None:
+                mode_prog = min(1.0, max(0.0, float(completed) / float(total)))
+            else:
+                m3 = batch_re.search(raw)
+                if m3:
+                    cur = int(m3.group(1))
+                    tot = int(m3.group(2))
+                    if tot > 0:
+                        mode_prog = min(1.0, max(0.0, float(cur - 1) / float(tot)))
+
+            overall: float | None = None
+            if mode_prog is not None:
+                idx = mode_index.get(mode, 0)
+                overall = min(1.0, max(0.0, (float(idx) + mode_prog) / float(len(mode_order))))
+
+            _set_job_state(
+                mode=mode,
+                mode_progress=mode_prog,
+                mode_completed=completed,
+                mode_total=total,
+                progress=overall,
+                message=f"updating {mode}: {raw}" if raw else None,
+            )
 
         while True:
             with update_wait_jobs_lock:
@@ -1196,6 +1396,11 @@ def create_app(*, settings: Settings) -> FastAPI:
                 job.latest_trade_date = latest
                 job.message = f"checking (attempt {job.attempts})"
                 job.last_error = None
+                job.mode = None
+                job.mode_progress = None
+                job.mode_completed = None
+                job.mode_total = None
+                job.progress = None
 
             if provider == "baostock":
                 ok_remote, detail = probe_baostock_daily_available(trade_date=target)
@@ -1206,6 +1411,11 @@ def create_app(*, settings: Settings) -> FastAPI:
                             return
                         job.latest_trade_date = latest
                         job.message = f"waiting for provider publish ({detail})"
+                        job.mode = None
+                        job.mode_progress = None
+                        job.mode_completed = None
+                        job.mode_total = None
+                        job.progress = None
                     remaining = timeout_seconds - (time.time() - started_at)
                     sleep_for = max(0.0, min(float(interval_seconds), float(remaining)))
                     if sleep_for <= 0:
@@ -1221,13 +1431,51 @@ def create_app(*, settings: Settings) -> FastAPI:
 
             try:
                 with update_lock:
-                    update_daily_all_service(
-                        settings=settings,
-                        start=None,
-                        end=target,
-                        provider=provider,
-                        repair_days=repair_days,
-                    )
+                    errors_bad: dict[str, str] = {}
+                    errors_incomplete: dict[str, str] = {}
+
+                    for mode in mode_order:
+                        _set_job_state(
+                            mode=mode,
+                            mode_progress=None,
+                            mode_completed=None,
+                            mode_total=None,
+                            progress=None,
+                            message=f"updating {mode}: starting",
+                        )
+                        mode_settings = settings.model_copy(update={"price_adjust": mode})
+                        try:
+                            update_daily_service(
+                                settings=mode_settings,
+                                start=None,
+                                end=target,
+                                provider=provider,
+                                repair_days=repair_days,
+                                progress_cb=lambda m, _mode=mode: _progress_cb(_mode, m),
+                            )
+                        except UpdateNotConfigured:
+                            raise
+                        except UpdateBadRequest as e:
+                            errors_bad[mode] = str(e)
+                        except UpdateIncomplete as e:
+                            errors_incomplete[mode] = str(e)
+                        else:
+                            idx = mode_index.get(mode, 0)
+                            _set_job_state(
+                                mode=mode,
+                                mode_progress=1.0,
+                                mode_completed=None,
+                                mode_total=None,
+                                progress=min(1.0, max(0.0, (float(idx) + 1.0) / float(len(mode_order)))),
+                                message=f"updating {mode}: done",
+                            )
+
+                    if errors_bad:
+                        msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_bad.items())])
+                        raise UpdateBadRequest(msg)
+                    if errors_incomplete:
+                        msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_incomplete.items())])
+                        raise UpdateIncomplete(msg)
             except (UpdateBadRequest, UpdateNotConfigured) as e:
                 _, latest = _local_ready(target)
                 with update_wait_jobs_lock:
@@ -2136,6 +2384,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             row = conn.execute(
                 """
                 SELECT enabled, interval_seconds, provider, repair_days,
+                       run_status, run_started_at, run_target_trade_date, run_mode, run_message,
                        last_run_at, last_success_at, last_success_trade_date, last_error
                 FROM auto_update_config
                 WHERE id = 1
@@ -2154,11 +2403,22 @@ def create_app(*, settings: Settings) -> FastAPI:
         repair_days = int(row["repair_days"] or 30)
         if repair_days < 0:
             repair_days = 30
+        run_status = str(row["run_status"] or "idle").strip().lower()
+        if run_status not in {"idle", "running"}:
+            run_status = "idle"
+        run_mode = str(row["run_mode"] or "").strip().lower() or None
+        if run_mode not in {"none", "qfq", "hfq"}:
+            run_mode = None
         return AutoUpdateConfig(
             enabled=bool(int(row["enabled"] or 0)),
             interval_seconds=interval_seconds,
             provider=provider,  # type: ignore[arg-type]
             repair_days=repair_days,
+            run_status=run_status,  # type: ignore[arg-type]
+            run_started_at=int(row["run_started_at"]) if row["run_started_at"] is not None else None,
+            run_target_trade_date=str(row["run_target_trade_date"]) if row["run_target_trade_date"] else None,
+            run_mode=run_mode,  # type: ignore[arg-type]
+            run_message=str(row["run_message"]) if row["run_message"] else None,
             last_run_at=int(row["last_run_at"]) if row["last_run_at"] is not None else None,
             last_success_at=int(row["last_success_at"]) if row["last_success_at"] is not None else None,
             last_success_trade_date=str(row["last_success_trade_date"]) if row["last_success_trade_date"] else None,

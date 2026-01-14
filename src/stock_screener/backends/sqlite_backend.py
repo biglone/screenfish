@@ -205,6 +205,13 @@ class SqliteBackend:
                   screen_last_count INTEGER,
                   screen_last_error TEXT,
 
+                  -- Auto update runtime status (best-effort; for UI visibility)
+                  run_status TEXT NOT NULL DEFAULT 'idle',
+                  run_started_at INTEGER,
+                  run_target_trade_date TEXT,
+                  run_mode TEXT,
+                  run_message TEXT,
+
                   last_run_at INTEGER,
                   last_success_at INTEGER,
                   last_success_trade_date TEXT,
@@ -224,6 +231,18 @@ class SqliteBackend:
         def _has_column(table: str, column: str) -> bool:
             rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
             return any(r["name"] == column for r in rows)
+
+        # Auto update config: add run-state columns for older DBs.
+        if not _has_column("auto_update_config", "run_status"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN run_status TEXT NOT NULL DEFAULT 'idle'")
+        if not _has_column("auto_update_config", "run_started_at"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN run_started_at INTEGER")
+        if not _has_column("auto_update_config", "run_target_trade_date"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN run_target_trade_date TEXT")
+        if not _has_column("auto_update_config", "run_mode"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN run_mode TEXT")
+        if not _has_column("auto_update_config", "run_message"):
+            conn.execute("ALTER TABLE auto_update_config ADD COLUMN run_message TEXT")
 
         # Formulas: add kind/timeframe columns for older DBs.
         if not _has_column("formulas", "kind"):
