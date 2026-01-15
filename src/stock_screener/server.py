@@ -1160,6 +1160,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                             stop_event.wait(idle_sleep)
                             continue
 
+                        sleep_for: float | None = None
+                        fatal_error = False
                         try:
                             errors_bad: dict[str, str] = {}
                             errors_incomplete: dict[str, str] = {}
@@ -1208,20 +1210,24 @@ def create_app(*, settings: Settings) -> FastAPI:
                                     """,
                                     (now2, msg, now2),
                                 )
-                            break
+                            fatal_error = True
                         except UpdateIncomplete as e:
                             _run_progress(None, f"{e}; retrying")
-                            stop_event.wait(error_backoff)
+                            sleep_for = error_backoff
                             error_backoff = min(300.0, error_backoff * 2.0)
                         except Exception as e:
                             _run_progress(None, f"error: {e}; retrying")
-                            stop_event.wait(error_backoff)
+                            sleep_for = error_backoff
                             error_backoff = min(300.0, error_backoff * 2.0)
                         else:
                             error_backoff = 10.0
                             _run_progress(None, "updated; checking data")
                         finally:
                             update_lock.release()
+                        if fatal_error:
+                            break
+                        if sleep_for is not None:
+                            stop_event.wait(sleep_for)
 
                 except Exception as e:
                     msg = (str(e) or "update failed")[:2000]
