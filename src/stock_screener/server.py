@@ -923,6 +923,52 @@ def create_app(*, settings: Settings) -> FastAPI:
         except Exception:
             pass
 
+        def _local_ready(trade_date: str) -> tuple[bool, str | None]:
+            def _tables(mode: str) -> tuple[str, str]:
+                m = (mode or "").strip().lower()
+                if m == "qfq":
+                    return "daily_qfq", "update_log_qfq"
+                if m == "hfq":
+                    return "daily_hfq", "update_log_hfq"
+                return "daily", "update_log"
+
+            latests: list[str] = []
+            ready = True
+            with backend.connect() as conn:
+                for mode in ("none", "qfq", "hfq"):
+                    daily_table, update_log_table = _tables(mode)
+                    try:
+                        row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {daily_table}").fetchone()
+                    except sqlite3.OperationalError:
+                        ready = False
+                        break
+                    if row and row["d"] is not None:
+                        latests.append(str(row["d"]))
+                    try:
+                        has_rows = (
+                            conn.execute(
+                                f"SELECT 1 FROM {daily_table} WHERE trade_date = ? LIMIT 1",
+                                (trade_date,),
+                            ).fetchone()
+                            is not None
+                        )
+                        marked = (
+                            conn.execute(
+                                f"SELECT 1 FROM {update_log_table} WHERE trade_date = ? LIMIT 1",
+                                (trade_date,),
+                            ).fetchone()
+                            is not None
+                        )
+                    except sqlite3.OperationalError:
+                        ready = False
+                        break
+                    if not (has_rows and marked):
+                        ready = False
+                        break
+
+            latest = max(latests) if latests else None
+            return ready, latest
+
         while not stop_event.is_set():
             try:
                 with backend.connect() as conn:
@@ -983,23 +1029,6 @@ def create_app(*, settings: Settings) -> FastAPI:
                     stop_event.wait(idle_sleep)
                     continue
 
-                if provider == "baostock" and target_end:
-                    ok_remote, detail = probe_baostock_daily_available(trade_date=target_end)
-                    if not ok_remote:
-                        msg = f"waiting for provider publish ({detail})"[:2000]
-                        now2 = int(time.time())
-                        with backend.connect() as conn:
-                            conn.execute(
-                                "UPDATE auto_update_config SET last_run_at = ?, last_error = ?, updated_at = ? WHERE id = 1",
-                                (now2, msg, now2),
-                            )
-                        stop_event.wait(idle_sleep)
-                        continue
-
-                if not update_lock.acquire(timeout=1.0):
-                    stop_event.wait(idle_sleep)
-                    continue
-
                 try:
                     run_started_at = int(time.time())
                     with backend.connect() as conn:
@@ -1012,186 +1041,207 @@ def create_app(*, settings: Settings) -> FastAPI:
                                 run_started_at = ?,
                                 run_target_trade_date = ?,
                                 run_mode = NULL,
-                                run_message = 'starting',
+                                run_message = 'checking',
                                 updated_at = ?
                             WHERE id = 1
                             """,
                             (run_started_at, run_started_at, target_end, run_started_at),
                         )
 
-                    try:
-                        errors_bad: dict[str, str] = {}
-                        errors_incomplete: dict[str, str] = {}
+                    attempt = 0
+                    publish_probe_interval = max(30.0, min(300.0, float(interval_seconds)))
+                    error_backoff = 10.0
 
-                        def _run_progress(mode: str, message: str) -> None:
-                            nowp = int(time.time())
-                            msg = (str(message or "").strip() or None)
-                            if msg is not None:
-                                msg = msg[:2000]
+                    def _run_progress(mode: str | None, message: str) -> None:
+                        nowp = int(time.time())
+                        msg = (str(message or "").strip() or None)
+                        if msg is not None:
+                            msg = msg[:2000]
+                        with backend.connect() as conn:
+                            conn.execute(
+                                """
+                                UPDATE auto_update_config
+                                SET run_mode = ?,
+                                    run_message = ?,
+                                    updated_at = ?
+                                WHERE id = 1
+                                """,
+                                (mode, msg, nowp),
+                            )
+
+                    while not stop_event.is_set():
+                        ready, _ = _local_ready(str(target_end))
+                        if ready:
+                            latest: str | None = None
+                            should_auto_screen = False
                             with backend.connect() as conn:
+                                now2 = int(time.time())
+                                latests: list[str] = []
+                                for table in ("update_log", "update_log_qfq", "update_log_hfq"):
+                                    try:
+                                        r = conn.execute(f"SELECT MAX(trade_date) AS d FROM {table}").fetchone()
+                                    except sqlite3.OperationalError:
+                                        continue
+                                    if r and r["d"] is not None:
+                                        latests.append(str(r["d"]))
+                                latest = max(latests) if latests else None
                                 conn.execute(
                                     """
                                     UPDATE auto_update_config
-                                    SET run_mode = ?,
-                                        run_message = ?,
+                                    SET last_run_at = ?,
+                                        last_success_at = ?,
+                                        last_success_trade_date = ?,
+                                        last_error = NULL,
+                                        run_status = 'idle',
+                                        run_started_at = NULL,
+                                        run_target_trade_date = NULL,
+                                        run_mode = NULL,
+                                        run_message = NULL,
                                         updated_at = ?
                                     WHERE id = 1
                                     """,
-                                    (mode, msg, nowp),
+                                    (now2, now2, latest, now2),
                                 )
 
-                        for mode in ("none", "qfq", "hfq"):
-                            _run_progress(mode, f"updating {mode}")
-                            mode_settings = settings.model_copy(update={"price_adjust": mode})
-                            try:
-                                update_daily_service(
-                                    settings=mode_settings,
-                                    start=None,
-                                    end=target_end,
-                                    provider=provider,
-                                    repair_days=repair_days,
-                                    progress_cb=lambda m, _mode=mode: _run_progress(_mode, m),
-                                )
-                            except UpdateNotConfigured:
-                                raise
-                            except UpdateBadRequest as e:
-                                errors_bad[mode] = str(e)
-                            except UpdateIncomplete as e:
-                                errors_incomplete[mode] = str(e)
-
-                        if errors_bad:
-                            msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_bad.items())])
-                            raise UpdateBadRequest(msg)
-                        if errors_incomplete:
-                            msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_incomplete.items())])
-                            raise UpdateIncomplete(msg)
-                    except UpdateIncomplete as e:
-                        msg = (str(e) or "update incomplete")[:2000]
-                        with backend.connect() as conn:
-                            now2 = int(time.time())
-                            conn.execute(
-                                """
-                                UPDATE auto_update_config
-                                SET last_error = ?,
-                                    run_status = 'idle',
-                                    run_started_at = NULL,
-                                    run_target_trade_date = NULL,
-                                    run_mode = NULL,
-                                    run_message = NULL,
-                                    updated_at = ?
-                                WHERE id = 1
-                                """,
-                                (msg, now2),
-                            )
-                    except (UpdateBadRequest, UpdateNotConfigured) as e:
-                        msg = (str(e) or "update failed")[:2000]
-                        with backend.connect() as conn:
-                            now2 = int(time.time())
-                            conn.execute(
-                                """
-                                UPDATE auto_update_config
-                                SET last_error = ?,
-                                    run_status = 'idle',
-                                    run_started_at = NULL,
-                                    run_target_trade_date = NULL,
-                                    run_mode = NULL,
-                                    run_message = NULL,
-                                    updated_at = ?
-                                WHERE id = 1
-                                """,
-                                (msg, now2),
-                            )
-                    except Exception as e:
-                        msg = (str(e) or "update failed")[:2000]
-                        with backend.connect() as conn:
-                            now2 = int(time.time())
-                            conn.execute(
-                                """
-                                UPDATE auto_update_config
-                                SET last_error = ?,
-                                    run_status = 'idle',
-                                    run_started_at = NULL,
-                                    run_target_trade_date = NULL,
-                                    run_mode = NULL,
-                                    run_message = NULL,
-                                    updated_at = ?
-                                WHERE id = 1
-                                """,
-                                (msg, now2),
-                            )
-                    else:
-                        latest: str | None = None
-                        should_auto_screen = False
-                        with backend.connect() as conn:
-                            now2 = int(time.time())
-                            latests: list[str] = []
-                            for table in ("update_log", "update_log_qfq", "update_log_hfq"):
-                                try:
-                                    r = conn.execute(f"SELECT MAX(trade_date) AS d FROM {table}").fetchone()
-                                except sqlite3.OperationalError:
-                                    continue
-                                if r and r["d"] is not None:
-                                    latests.append(str(r["d"]))
-                            latest = max(latests) if latests else None
-                            conn.execute(
-                                """
-                                UPDATE auto_update_config
-                                SET last_success_at = ?,
-                                    last_success_trade_date = ?,
-                                    last_error = NULL,
-                                    run_status = 'idle',
-                                    run_started_at = NULL,
-                                    run_target_trade_date = NULL,
-                                    run_mode = NULL,
-                                    run_message = NULL,
-                                    updated_at = ?
-                                WHERE id = 1
-                                """,
-                                (now2, latest, now2),
-                            )
-
-                            if latest:
-                                r2 = conn.execute(
-                                    """
-                                    SELECT screen_enabled, screen_last_trade_date
-                                    FROM auto_update_config
-                                    WHERE id = 1
-                                    LIMIT 1
-                                    """
-                                ).fetchone()
-                                if r2 and int(r2["screen_enabled"] or 0) == 1:
-                                    last_screened = str(r2["screen_last_trade_date"]) if r2["screen_last_trade_date"] else None
-                                    if last_screened != latest:
-                                        should_auto_screen = True
-
-                        if should_auto_screen and latest:
-                            try:
-                                _run_auto_screen_job(
-                                    settings=settings,
-                                    target_date=latest,
-                                    force=False,
-                                    require_enabled=True,
-                                    user=None,
-                                )
-                            except Exception as e:
-                                msg = (str(e) or "auto screen failed")[:2000]
-                                with backend.connect() as conn:
-                                    now3 = int(time.time())
-                                    conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-                                    conn.execute(
+                                if latest:
+                                    r2 = conn.execute(
                                         """
-                                        UPDATE auto_update_config
-                                        SET screen_last_run_at = ?,
-                                            screen_last_trade_date = ?,
-                                            screen_last_count = ?,
-                                            screen_last_error = ?,
-                                            updated_at = ?
+                                        SELECT screen_enabled, screen_last_trade_date
+                                        FROM auto_update_config
                                         WHERE id = 1
-                                        """,
-                                        (now3, latest, 0, msg, now3),
+                                        LIMIT 1
+                                        """
+                                    ).fetchone()
+                                    if r2 and int(r2["screen_enabled"] or 0) == 1:
+                                        last_screened = (
+                                            str(r2["screen_last_trade_date"]) if r2["screen_last_trade_date"] else None
+                                        )
+                                        if last_screened != latest:
+                                            should_auto_screen = True
+
+                            if should_auto_screen and latest:
+                                try:
+                                    _run_auto_screen_job(
+                                        settings=settings,
+                                        target_date=latest,
+                                        force=False,
+                                        require_enabled=True,
+                                        user=None,
                                     )
-                finally:
-                    update_lock.release()
+                                except Exception as e:
+                                    msg = (str(e) or "auto screen failed")[:2000]
+                                    with backend.connect() as conn:
+                                        now3 = int(time.time())
+                                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                                        conn.execute(
+                                            """
+                                            UPDATE auto_update_config
+                                            SET screen_last_run_at = ?,
+                                                screen_last_trade_date = ?,
+                                                screen_last_count = ?,
+                                                screen_last_error = ?,
+                                                updated_at = ?
+                                            WHERE id = 1
+                                            """,
+                                            (now3, latest, 0, msg, now3),
+                                        )
+                            break
+
+                        if provider == "baostock" and target_end:
+                            ok_remote, detail = probe_baostock_daily_available(trade_date=target_end)
+                            if not ok_remote:
+                                _run_progress(None, f"waiting for provider publish ({detail})")
+                                stop_event.wait(publish_probe_interval)
+                                continue
+
+                        attempt += 1
+                        if not update_lock.acquire(timeout=1.0):
+                            _run_progress(None, "waiting for other update task")
+                            stop_event.wait(idle_sleep)
+                            continue
+
+                        try:
+                            errors_bad: dict[str, str] = {}
+                            errors_incomplete: dict[str, str] = {}
+
+                            for mode in ("none", "qfq", "hfq"):
+                                _run_progress(mode, f"updating {mode} (attempt {attempt})")
+                                mode_settings = settings.model_copy(update={"price_adjust": mode})
+                                try:
+                                    update_daily_service(
+                                        settings=mode_settings,
+                                        start=None,
+                                        end=target_end,
+                                        provider=provider,
+                                        repair_days=repair_days,
+                                        progress_cb=lambda m, _mode=mode: _run_progress(_mode, m),
+                                    )
+                                except UpdateNotConfigured:
+                                    raise
+                                except UpdateBadRequest as e:
+                                    errors_bad[mode] = str(e)
+                                except UpdateIncomplete as e:
+                                    errors_incomplete[mode] = str(e)
+
+                            if errors_bad:
+                                msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_bad.items())])
+                                raise UpdateBadRequest(msg)
+                            if errors_incomplete:
+                                msg = "; ".join([f"{k}: {v}" for k, v in sorted(errors_incomplete.items())])
+                                raise UpdateIncomplete(msg)
+                        except (UpdateBadRequest, UpdateNotConfigured) as e:
+                            msg = (str(e) or "update failed")[:2000]
+                            with backend.connect() as conn:
+                                now2 = int(time.time())
+                                conn.execute(
+                                    """
+                                    UPDATE auto_update_config
+                                    SET last_run_at = ?,
+                                        last_error = ?,
+                                        run_status = 'idle',
+                                        run_started_at = NULL,
+                                        run_target_trade_date = NULL,
+                                        run_mode = NULL,
+                                        run_message = NULL,
+                                        updated_at = ?
+                                    WHERE id = 1
+                                    """,
+                                    (now2, msg, now2),
+                                )
+                            break
+                        except UpdateIncomplete as e:
+                            _run_progress(None, f"{e}; retrying")
+                            stop_event.wait(error_backoff)
+                            error_backoff = min(300.0, error_backoff * 2.0)
+                        except Exception as e:
+                            _run_progress(None, f"error: {e}; retrying")
+                            stop_event.wait(error_backoff)
+                            error_backoff = min(300.0, error_backoff * 2.0)
+                        else:
+                            error_backoff = 10.0
+                            _run_progress(None, "updated; checking data")
+                        finally:
+                            update_lock.release()
+
+                except Exception as e:
+                    msg = (str(e) or "update failed")[:2000]
+                    with backend.connect() as conn:
+                        now2 = int(time.time())
+                        conn.execute(
+                            """
+                            UPDATE auto_update_config
+                            SET last_run_at = ?,
+                                last_error = ?,
+                                run_status = 'idle',
+                                run_started_at = NULL,
+                                run_target_trade_date = NULL,
+                                run_mode = NULL,
+                                run_message = NULL,
+                                updated_at = ?
+                            WHERE id = 1
+                            """,
+                            (now2, msg, now2),
+                        )
 
                 stop_event.wait(1.0)
             except Exception:
