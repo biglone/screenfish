@@ -1405,6 +1405,48 @@ def create_app(*, settings: Settings) -> FastAPI:
                     job.latest_trade_date = latest
                     job.message = "daily data available"
                     job.finished_at = time.time()
+                # Best-effort: if auto-screen is enabled and has not run for this trade date yet,
+                # run it now so manual updates also populate the configured watchlist group.
+                try:
+                    backend = _backend(settings)
+                    with backend.connect() as conn:
+                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                        row = conn.execute(
+                            """
+                            SELECT screen_enabled, screen_last_trade_date
+                            FROM auto_update_config
+                            WHERE id = 1
+                            LIMIT 1
+                            """
+                        ).fetchone()
+                    enabled = bool(row and int(row["screen_enabled"] or 0) == 1)
+                    last_screened = str(row["screen_last_trade_date"]) if row and row["screen_last_trade_date"] else None
+                    if enabled and last_screened != target:
+                        _run_auto_screen_job(
+                            settings=settings,
+                            target_date=target,
+                            force=False,
+                            require_enabled=True,
+                            user=None,
+                        )
+                except Exception as e:
+                    msg = (str(e) or "auto screen failed")[:2000]
+                    now3 = int(time.time())
+                    backend = _backend(settings)
+                    with backend.connect() as conn:
+                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                        conn.execute(
+                            """
+                            UPDATE auto_update_config
+                            SET screen_last_run_at = ?,
+                                screen_last_trade_date = ?,
+                                screen_last_count = ?,
+                                screen_last_error = ?,
+                                updated_at = ?
+                            WHERE id = 1
+                            """,
+                            (now3, target, 0, msg, now3),
+                        )
                 return
 
             with update_wait_jobs_lock:
@@ -1531,6 +1573,47 @@ def create_app(*, settings: Settings) -> FastAPI:
                     job.latest_trade_date = latest
                     job.message = "daily data available"
                     job.finished_at = time.time()
+                # Best-effort: trigger auto-screen after a successful update/wait run.
+                try:
+                    backend = _backend(settings)
+                    with backend.connect() as conn:
+                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                        row = conn.execute(
+                            """
+                            SELECT screen_enabled, screen_last_trade_date
+                            FROM auto_update_config
+                            WHERE id = 1
+                            LIMIT 1
+                            """
+                        ).fetchone()
+                    enabled = bool(row and int(row["screen_enabled"] or 0) == 1)
+                    last_screened = str(row["screen_last_trade_date"]) if row and row["screen_last_trade_date"] else None
+                    if enabled and last_screened != target:
+                        _run_auto_screen_job(
+                            settings=settings,
+                            target_date=target,
+                            force=False,
+                            require_enabled=True,
+                            user=None,
+                        )
+                except Exception as e:
+                    msg = (str(e) or "auto screen failed")[:2000]
+                    now3 = int(time.time())
+                    backend = _backend(settings)
+                    with backend.connect() as conn:
+                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+                        conn.execute(
+                            """
+                            UPDATE auto_update_config
+                            SET screen_last_run_at = ?,
+                                screen_last_trade_date = ?,
+                                screen_last_count = ?,
+                                screen_last_error = ?,
+                                updated_at = ?
+                            WHERE id = 1
+                            """,
+                            (now3, target, 0, msg, now3),
+                        )
                 return
 
             with update_wait_jobs_lock:
