@@ -2815,6 +2815,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
         group_name = _auto_screen_group_name(base_group_name, trade_date)
+        if last_trade_date != trade_date:
+            existing_group_id = None
 
         if not force and last_trade_date == trade_date:
             if existing_group_id is None:
