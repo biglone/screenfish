@@ -298,6 +298,7 @@ class AutoUpdateConfig(BaseModel):
 
 
 class AutoScreenConfig(BaseModel):
+    id: str | None = None
     enabled: bool = False
     group_name: str = Field(default="自动筛选", min_length=1, max_length=30)
     group_id: str | None = None
@@ -328,6 +329,14 @@ class AutoScreenConfigUpdate(BaseModel):
     replace_group: bool = True
 
 
+class AutoScreenConfigCreate(AutoScreenConfigUpdate):
+    pass
+
+
+class AutoScreenConfigListResponse(BaseModel):
+    configs: list[AutoScreenConfig]
+
+
 class AutoScreenRunResponse(BaseModel):
     ok: bool
     trade_date: str
@@ -341,6 +350,7 @@ class AutoScreenRunResponse(BaseModel):
 class AutoScreenRunRequest(BaseModel):
     date: str | Literal["latest"] = "latest"
     force: bool = False
+    config_id: str | None = None
 
 
 class ScreenRequest(BaseModel):
@@ -1092,7 +1102,6 @@ def create_app(*, settings: Settings) -> FastAPI:
                         ready, _ = _local_ready(str(target_end))
                         if ready:
                             latest: str | None = None
-                            should_auto_screen = False
                             with backend.connect() as conn:
                                 now2 = int(time.time())
                                 latests: list[str] = []
@@ -1123,47 +1132,10 @@ def create_app(*, settings: Settings) -> FastAPI:
                                 )
 
                                 if latest:
-                                    r2 = conn.execute(
-                                        """
-                                        SELECT screen_enabled, screen_last_trade_date
-                                        FROM auto_update_config
-                                        WHERE id = 1
-                                        LIMIT 1
-                                        """
-                                    ).fetchone()
-                                    if r2 and int(r2["screen_enabled"] or 0) == 1:
-                                        last_screened = (
-                                            str(r2["screen_last_trade_date"]) if r2["screen_last_trade_date"] else None
-                                        )
-                                        if last_screened != latest:
-                                            should_auto_screen = True
-
-                            if should_auto_screen and latest:
-                                try:
-                                    _run_auto_screen_job(
-                                        settings=settings,
-                                        target_date=latest,
-                                        force=False,
-                                        require_enabled=True,
-                                        user=None,
-                                    )
-                                except Exception as e:
-                                    msg = (str(e) or "auto screen failed")[:2000]
-                                    with backend.connect() as conn:
-                                        now3 = int(time.time())
-                                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-                                        conn.execute(
-                                            """
-                                            UPDATE auto_update_config
-                                            SET screen_last_run_at = ?,
-                                                screen_last_trade_date = ?,
-                                                screen_last_count = ?,
-                                                screen_last_error = ?,
-                                                updated_at = ?
-                                            WHERE id = 1
-                                            """,
-                                            (now3, latest, 0, msg, now3),
-                                        )
+                                    try:
+                                        _run_auto_screen_jobs(settings=settings, target_date=latest, user=None)
+                                    except Exception:
+                                        pass
                             break
 
                         if provider == "baostock" and target_end:
@@ -1480,48 +1452,11 @@ def create_app(*, settings: Settings) -> FastAPI:
                     job.latest_trade_date = latest
                     job.message = "daily data available"
                     job.finished_at = time.time()
-                # Best-effort: if auto-screen is enabled and has not run for this trade date yet,
-                # run it now so manual updates also populate the configured watchlist group.
+                # Best-effort: run auto-screen configs after manual update finishes.
                 try:
-                    backend = _backend(settings)
-                    with backend.connect() as conn:
-                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-                        row = conn.execute(
-                            """
-                            SELECT screen_enabled, screen_last_trade_date
-                            FROM auto_update_config
-                            WHERE id = 1
-                            LIMIT 1
-                            """
-                        ).fetchone()
-                    enabled = bool(row and int(row["screen_enabled"] or 0) == 1)
-                    last_screened = str(row["screen_last_trade_date"]) if row and row["screen_last_trade_date"] else None
-                    if enabled and last_screened != target:
-                        _run_auto_screen_job(
-                            settings=settings,
-                            target_date=target,
-                            force=False,
-                            require_enabled=True,
-                            user=None,
-                        )
-                except Exception as e:
-                    msg = (str(e) or "auto screen failed")[:2000]
-                    now3 = int(time.time())
-                    backend = _backend(settings)
-                    with backend.connect() as conn:
-                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-                        conn.execute(
-                            """
-                            UPDATE auto_update_config
-                            SET screen_last_run_at = ?,
-                                screen_last_trade_date = ?,
-                                screen_last_count = ?,
-                                screen_last_error = ?,
-                                updated_at = ?
-                            WHERE id = 1
-                            """,
-                            (now3, target, 0, msg, now3),
-                        )
+                    _run_auto_screen_jobs(settings=settings, target_date=target, user=None)
+                except Exception:
+                    pass
                 return
 
             with update_wait_jobs_lock:
@@ -1650,45 +1585,9 @@ def create_app(*, settings: Settings) -> FastAPI:
                     job.finished_at = time.time()
                 # Best-effort: trigger auto-screen after a successful update/wait run.
                 try:
-                    backend = _backend(settings)
-                    with backend.connect() as conn:
-                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-                        row = conn.execute(
-                            """
-                            SELECT screen_enabled, screen_last_trade_date
-                            FROM auto_update_config
-                            WHERE id = 1
-                            LIMIT 1
-                            """
-                        ).fetchone()
-                    enabled = bool(row and int(row["screen_enabled"] or 0) == 1)
-                    last_screened = str(row["screen_last_trade_date"]) if row and row["screen_last_trade_date"] else None
-                    if enabled and last_screened != target:
-                        _run_auto_screen_job(
-                            settings=settings,
-                            target_date=target,
-                            force=False,
-                            require_enabled=True,
-                            user=None,
-                        )
-                except Exception as e:
-                    msg = (str(e) or "auto screen failed")[:2000]
-                    now3 = int(time.time())
-                    backend = _backend(settings)
-                    with backend.connect() as conn:
-                        conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-                        conn.execute(
-                            """
-                            UPDATE auto_update_config
-                            SET screen_last_run_at = ?,
-                                screen_last_trade_date = ?,
-                                screen_last_count = ?,
-                                screen_last_error = ?,
-                                updated_at = ?
-                            WHERE id = 1
-                            """,
-                            (now3, target, 0, msg, now3),
-                        )
+                    _run_auto_screen_jobs(settings=settings, target_date=target, user=None)
+                except Exception:
+                    pass
                 return
 
             with update_wait_jobs_lock:
@@ -2624,70 +2523,358 @@ def create_app(*, settings: Settings) -> FastAPI:
             )
         return get_auto_update_config(settings=settings)
 
+    def _normalize_auto_screen_row(row: Any) -> dict[str, Any]:
+        keys = set(row.keys()) if hasattr(row, "keys") else set(row)
+        if "screen_enabled" in keys:
+            return {
+                "id": "default",
+                "enabled": row["screen_enabled"],
+                "combo": row["screen_combo"],
+                "rules": row["screen_rules"],
+                "lookback_days": row["screen_lookback_days"],
+                "with_name": row["screen_with_name"],
+                "exclude_st": row["screen_exclude_st"],
+                "price_adjust": row["screen_price_adjust"],
+                "owner_id": row["screen_owner_id"] if "screen_owner_id" in keys else None,
+                "group_name": row["screen_group_name"],
+                "group_id": row["screen_group_id"],
+                "replace_group": row["screen_replace_group"],
+                "last_run_at": row["screen_last_run_at"],
+                "last_trade_date": row["screen_last_trade_date"],
+                "last_count": row["screen_last_count"],
+                "last_error": row["screen_last_error"],
+                "created_at": row["screen_last_run_at"],
+                "updated_at": row["screen_last_run_at"],
+            }
+        return dict(row)
+
     def _auto_screen_config_from_row(row: Any) -> AutoScreenConfig:
-        combo = str(row["screen_combo"] or "and").strip().lower()
+        data = _normalize_auto_screen_row(row)
+        combo = str(data.get("combo") or "and").strip().lower()
         if combo not in {"and", "or"}:
             combo = "and"
 
-        price_adjust = str(row["screen_price_adjust"] or "qfq").strip().lower()
+        price_adjust = str(data.get("price_adjust") or "qfq").strip().lower()
         if price_adjust not in {"none", "qfq", "hfq"}:
             price_adjust = "qfq"
 
-        lookback_days = int(row["screen_lookback_days"] or 200)
+        lookback_days = int(data.get("lookback_days") or 200)
         if lookback_days < 0:
             lookback_days = 200
         if lookback_days > 20000:
             lookback_days = 20000
 
-        group_name = _normalize_watchlist_group_name(str(row["screen_group_name"] or "自动筛选")) or "自动筛选"
-        rules_raw = row["screen_rules"]
+        group_name = _normalize_watchlist_group_name(str(data.get("group_name") or "自动筛选")) or "自动筛选"
+        rules_raw = data.get("rules")
         rules = None
         if rules_raw is not None and str(rules_raw).strip():
             rules = str(rules_raw).strip()
 
         return AutoScreenConfig(
-            enabled=bool(int(row["screen_enabled"] or 0)),
+            id=str(data.get("id")) if data.get("id") else None,
+            enabled=bool(int(data.get("enabled") or 0)),
             group_name=group_name,
-            group_id=str(row["screen_group_id"]) if row["screen_group_id"] else None,
+            group_id=str(data.get("group_id")) if data.get("group_id") else None,
             combo=combo,  # type: ignore[arg-type]
             rules=rules,
             lookback_days=lookback_days,
-            with_name=bool(int(row["screen_with_name"] or 0)),
-            exclude_st=bool(int(row["screen_exclude_st"] or 0)),
+            with_name=bool(int(data.get("with_name") or 0)),
+            exclude_st=bool(int(data.get("exclude_st") or 0)),
             price_adjust=price_adjust,  # type: ignore[arg-type]
-            replace_group=bool(int(row["screen_replace_group"] or 0)),
-            last_run_at=int(row["screen_last_run_at"]) if row["screen_last_run_at"] is not None else None,
-            last_trade_date=str(row["screen_last_trade_date"]) if row["screen_last_trade_date"] else None,
-            last_count=int(row["screen_last_count"]) if row["screen_last_count"] is not None else None,
-            last_error=str(row["screen_last_error"]) if row["screen_last_error"] else None,
+            replace_group=bool(int(data.get("replace_group") or 0)),
+            last_run_at=int(data.get("last_run_at")) if data.get("last_run_at") is not None else None,
+            last_trade_date=str(data.get("last_trade_date")) if data.get("last_trade_date") else None,
+            last_count=int(data.get("last_count")) if data.get("last_count") is not None else None,
+            last_error=str(data.get("last_error")) if data.get("last_error") else None,
         )
 
-    @app.get("/auto-screen-config", response_model=AutoScreenConfig, dependencies=[Depends(_admin_required)])
-    def get_auto_screen_config(settings: Settings = Depends(_settings_dep)) -> AutoScreenConfig:
-        backend = _backend(settings)
-        with backend.connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+    def _ensure_default_auto_screen_config(conn: Any) -> dict[str, Any] | None:
+        try:
             row = conn.execute(
+                """
+                SELECT
+                  id, enabled, combo, rules, lookback_days,
+                  with_name, exclude_st, price_adjust,
+                  owner_id, group_name, group_id, replace_group,
+                  last_run_at, last_trade_date, last_count, last_error,
+                  created_at, updated_at
+                FROM auto_screen_configs
+                WHERE id = 'default'
+                LIMIT 1
+                """
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row:
+            return dict(row)
+
+        now = int(time.time())
+        try:
+            legacy = conn.execute(
                 """
                 SELECT
                   screen_enabled, screen_combo, screen_rules, screen_lookback_days,
                   screen_with_name, screen_exclude_st, screen_price_adjust,
-                  screen_group_name, screen_group_id, screen_replace_group,
+                  screen_owner_id, screen_group_name, screen_group_id, screen_replace_group,
                   screen_last_run_at, screen_last_trade_date, screen_last_count, screen_last_error
                 FROM auto_update_config
                 WHERE id = 1
                 LIMIT 1
                 """
             ).fetchone()
+        except sqlite3.OperationalError:
+            legacy = None
+
+        data = _normalize_auto_screen_row(legacy) if legacy else {
+            "id": "default",
+            "enabled": 0,
+            "combo": "and",
+            "rules": None,
+            "lookback_days": 200,
+            "with_name": 0,
+            "exclude_st": 0,
+            "price_adjust": "qfq",
+            "owner_id": None,
+            "group_name": "自动筛选",
+            "group_id": None,
+            "replace_group": 1,
+            "last_run_at": None,
+            "last_trade_date": None,
+            "last_count": None,
+            "last_error": None,
+        }
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO auto_screen_configs (
+                  id, enabled, combo, rules, lookback_days, with_name, exclude_st,
+                  price_adjust, owner_id, group_name, group_id, replace_group,
+                  last_run_at, last_trade_date, last_count, last_error,
+                  created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "default",
+                    int(data.get("enabled") or 0),
+                    data.get("combo") or "and",
+                    data.get("rules"),
+                    int(data.get("lookback_days") or 200),
+                    int(data.get("with_name") or 0),
+                    int(data.get("exclude_st") or 0),
+                    data.get("price_adjust") or "qfq",
+                    data.get("owner_id"),
+                    data.get("group_name") or "自动筛选",
+                    data.get("group_id"),
+                    int(data.get("replace_group") or 1),
+                    data.get("last_run_at"),
+                    data.get("last_trade_date"),
+                    data.get("last_count"),
+                    data.get("last_error"),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                  id, enabled, combo, rules, lookback_days,
+                  with_name, exclude_st, price_adjust,
+                  owner_id, group_name, group_id, replace_group,
+                  last_run_at, last_trade_date, last_count, last_error,
+                  created_at, updated_at
+                FROM auto_screen_configs
+                WHERE id = 'default'
+                LIMIT 1
+                """
+            ).fetchone()
+            return dict(row) if row else data
+        except sqlite3.OperationalError:
+            return data
+
+    def _fetch_auto_screen_configs(
+        conn: Any,
+        *,
+        config_ids: list[str] | None = None,
+        enabled_only: bool = False,
+        ensure_default: bool = False,
+    ) -> list[dict[str, Any]]:
+        configs: list[dict[str, Any]] = []
+        try:
+            if config_ids:
+                placeholders = ",".join(["?"] * len(config_ids))
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                      id, enabled, combo, rules, lookback_days,
+                      with_name, exclude_st, price_adjust,
+                      owner_id, group_name, group_id, replace_group,
+                      last_run_at, last_trade_date, last_count, last_error,
+                      created_at, updated_at
+                    FROM auto_screen_configs
+                    WHERE id IN ({placeholders})
+                    """,
+                    list(config_ids),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                      id, enabled, combo, rules, lookback_days,
+                      with_name, exclude_st, price_adjust,
+                      owner_id, group_name, group_id, replace_group,
+                      last_run_at, last_trade_date, last_count, last_error,
+                      created_at, updated_at
+                    FROM auto_screen_configs
+                    ORDER BY created_at ASC
+                    """
+                ).fetchall()
+            for row in rows:
+                data = dict(row)
+                if enabled_only and int(data.get("enabled") or 0) != 1:
+                    continue
+                configs.append(data)
+        except sqlite3.OperationalError:
+            configs = []
+
+        if configs:
+            return configs
+
+        if ensure_default and not config_ids:
+            row = _ensure_default_auto_screen_config(conn)
+            if row:
+                configs = [row]
+
+        if configs:
+            if enabled_only:
+                return [c for c in configs if int(c.get("enabled") or 0) == 1]
+            return configs
+
+        if config_ids:
+            return []
+
+        try:
+            legacy = conn.execute(
+                """
+                SELECT
+                  screen_enabled, screen_combo, screen_rules, screen_lookback_days,
+                  screen_with_name, screen_exclude_st, screen_price_adjust,
+                  screen_owner_id, screen_group_name, screen_group_id, screen_replace_group,
+                  screen_last_run_at, screen_last_trade_date, screen_last_count, screen_last_error
+                FROM auto_update_config
+                WHERE id = 1
+                LIMIT 1
+                """
+            ).fetchone()
+        except sqlite3.OperationalError:
+            legacy = None
+        if legacy:
+            data = _normalize_auto_screen_row(legacy)
+            if enabled_only and int(data.get("enabled") or 0) != 1:
+                return []
+            return [data]
+        return []
+
+    def _update_auto_screen_owner(
+        conn: Any,
+        *,
+        config_id: str,
+        owner_id: str | None,
+        reset_group: bool,
+        now: int,
+    ) -> None:
+        try:
+            if reset_group:
+                conn.execute(
+                    """
+                    UPDATE auto_screen_configs
+                    SET owner_id = ?, group_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (owner_id, now, config_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE auto_screen_configs
+                    SET owner_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (owner_id, now, config_id),
+                )
+        except sqlite3.OperationalError:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+            if reset_group:
+                conn.execute(
+                    """
+                    UPDATE auto_update_config
+                    SET screen_owner_id = ?, screen_group_id = NULL, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (owner_id, now),
+                )
+            else:
+                conn.execute(
+                    "UPDATE auto_update_config SET screen_owner_id = ?, updated_at = ? WHERE id = 1",
+                    (owner_id, now),
+                )
+
+    def _update_auto_screen_status(
+        conn: Any,
+        *,
+        config_id: str,
+        group_id: str | None,
+        last_run_at: int | None,
+        last_trade_date: str | None,
+        last_count: int | None,
+        last_error: str | None,
+        now: int,
+    ) -> None:
+        try:
+            conn.execute(
+                """
+                UPDATE auto_screen_configs
+                SET group_id = ?,
+                    last_run_at = ?,
+                    last_trade_date = ?,
+                    last_count = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (group_id, last_run_at, last_trade_date, last_count, last_error, now, config_id),
+            )
+        except sqlite3.OperationalError:
+            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
+            conn.execute(
+                """
+                UPDATE auto_update_config
+                SET screen_group_id = ?,
+                    screen_last_run_at = ?,
+                    screen_last_trade_date = ?,
+                    screen_last_count = ?,
+                    screen_last_error = ?,
+                    updated_at = ?
+                WHERE id = 1
+                """,
+                (group_id, last_run_at, last_trade_date, last_count, last_error, now),
+            )
+
+    @app.get("/auto-screen-config", response_model=AutoScreenConfig, dependencies=[Depends(_admin_required)])
+    def get_auto_screen_config(settings: Settings = Depends(_settings_dep)) -> AutoScreenConfig:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            row = _ensure_default_auto_screen_config(conn)
         if not row:
-            raise HTTPException(status_code=500, detail="auto_update_config missing")
+            raise HTTPException(status_code=500, detail="auto screen config missing")
         return _auto_screen_config_from_row(row)
 
     @app.put("/auto-screen-config", response_model=AutoScreenConfig, dependencies=[Depends(_admin_required)])
     def update_auto_screen_config(
         req: AutoScreenConfigUpdate,
         settings: Settings = Depends(_settings_dep),
-        user: AuthUser | None = Depends(_access_required),
+        user: AuthUser | None = Depends(_admin_required),
     ) -> AutoScreenConfig:
         group_name = _normalize_watchlist_group_name(req.group_name)
         if not group_name:
@@ -2701,32 +2888,31 @@ def create_app(*, settings: Settings) -> FastAPI:
 
         now = int(time.time())
         with backend.connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-
+            row = _ensure_default_auto_screen_config(conn)
+            prev_owner_id = str(row.get("owner_id")) if row and row.get("owner_id") else None
+            owner_id = prev_owner_id
             if user is not None and app.state.app_state.auth_enabled:
-                prev = conn.execute(
-                    "SELECT screen_owner_id FROM auto_update_config WHERE id = 1 LIMIT 1"
-                ).fetchone()
-                prev_owner_id = str(prev["screen_owner_id"]) if prev and prev["screen_owner_id"] else None
-                if prev_owner_id != user.id:
-                    conn.execute("UPDATE auto_update_config SET screen_group_id = NULL WHERE id = 1")
-                conn.execute("UPDATE auto_update_config SET screen_owner_id = ? WHERE id = 1", (user.id,))
-
+                owner_id = user.id
+            if owner_id is None:
+                owner_id = _resolve_auto_screen_owner_id(conn, user=user)
+            if prev_owner_id and owner_id != prev_owner_id:
+                conn.execute("UPDATE auto_screen_configs SET group_id = NULL WHERE id = 'default'")
             conn.execute(
                 """
-                UPDATE auto_update_config
-                SET screen_enabled = ?,
-                    screen_combo = ?,
-                    screen_rules = ?,
-                    screen_lookback_days = ?,
-                    screen_with_name = ?,
-                    screen_exclude_st = ?,
-                    screen_price_adjust = ?,
-                    screen_group_name = ?,
-                    screen_replace_group = ?,
-                    screen_last_error = NULL,
+                UPDATE auto_screen_configs
+                SET enabled = ?,
+                    combo = ?,
+                    rules = ?,
+                    lookback_days = ?,
+                    with_name = ?,
+                    exclude_st = ?,
+                    price_adjust = ?,
+                    owner_id = ?,
+                    group_name = ?,
+                    replace_group = ?,
+                    last_error = NULL,
                     updated_at = ?
-                WHERE id = 1
+                WHERE id = 'default'
                 """,
                 (
                     1 if req.enabled else 0,
@@ -2736,12 +2922,166 @@ def create_app(*, settings: Settings) -> FastAPI:
                     1 if req.with_name else 0,
                     1 if req.exclude_st else 0,
                     req.price_adjust,
+                    owner_id,
                     group_name,
                     1 if req.replace_group else 0,
                     now,
                 ),
             )
         return get_auto_screen_config(settings=settings)
+
+    @app.get("/auto-screen-configs", response_model=AutoScreenConfigListResponse, dependencies=[Depends(_admin_required)])
+    def list_auto_screen_configs(settings: Settings = Depends(_settings_dep)) -> AutoScreenConfigListResponse:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            rows = _fetch_auto_screen_configs(conn, ensure_default=True)
+        return AutoScreenConfigListResponse(configs=[_auto_screen_config_from_row(r) for r in rows])
+
+    @app.post("/auto-screen-configs", response_model=AutoScreenConfig, dependencies=[Depends(_admin_required)])
+    def create_auto_screen_config(
+        req: AutoScreenConfigCreate,
+        settings: Settings = Depends(_settings_dep),
+        user: AuthUser | None = Depends(_admin_required),
+    ) -> AutoScreenConfig:
+        backend = _backend(settings)
+        try:
+            resolve_rules(req.rules, backend=backend)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        now = int(time.time())
+        group_name = _normalize_watchlist_group_name(req.group_name) or "自动筛选"
+        with backend.connect() as conn:
+            owner_id = _resolve_auto_screen_owner_id(conn, user=user)
+            config_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO auto_screen_configs (
+                  id, enabled, combo, rules, lookback_days, with_name, exclude_st,
+                  price_adjust, owner_id, group_name, group_id, replace_group,
+                  last_run_at, last_trade_date, last_count, last_error,
+                  created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    config_id,
+                    1 if req.enabled else 0,
+                    req.combo,
+                    (req.rules.strip() if req.rules and req.rules.strip() else None),
+                    req.lookback_days,
+                    1 if req.with_name else 0,
+                    1 if req.exclude_st else 0,
+                    req.price_adjust,
+                    owner_id,
+                    group_name,
+                    1 if req.replace_group else 0,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                  id, enabled, combo, rules, lookback_days,
+                  with_name, exclude_st, price_adjust,
+                  owner_id, group_name, group_id, replace_group,
+                  last_run_at, last_trade_date, last_count, last_error,
+                  created_at, updated_at
+                FROM auto_screen_configs
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (config_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="failed to create auto screen config")
+        return _auto_screen_config_from_row(row)
+
+    @app.put("/auto-screen-configs/{config_id}", response_model=AutoScreenConfig, dependencies=[Depends(_admin_required)])
+    def update_auto_screen_config_item(
+        config_id: str,
+        req: AutoScreenConfigUpdate,
+        settings: Settings = Depends(_settings_dep),
+        user: AuthUser | None = Depends(_admin_required),
+    ) -> AutoScreenConfig:
+        backend = _backend(settings)
+        try:
+            resolve_rules(req.rules, backend=backend)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        now = int(time.time())
+        group_name = _normalize_watchlist_group_name(req.group_name) or "自动筛选"
+        with backend.connect() as conn:
+            row = conn.execute(
+                "SELECT owner_id FROM auto_screen_configs WHERE id = ? LIMIT 1",
+                (config_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="config not found")
+            owner_id = row["owner_id"]
+            if user is not None and app.state.app_state.auth_enabled:
+                owner_id = user.id
+            if owner_id is None:
+                owner_id = _resolve_auto_screen_owner_id(conn, user=user)
+            conn.execute(
+                """
+                UPDATE auto_screen_configs
+                SET enabled = ?,
+                    combo = ?,
+                    rules = ?,
+                    lookback_days = ?,
+                    with_name = ?,
+                    exclude_st = ?,
+                    price_adjust = ?,
+                    owner_id = ?,
+                    group_name = ?,
+                    replace_group = ?,
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    1 if req.enabled else 0,
+                    req.combo,
+                    (req.rules.strip() if req.rules and req.rules.strip() else None),
+                    req.lookback_days,
+                    1 if req.with_name else 0,
+                    1 if req.exclude_st else 0,
+                    req.price_adjust,
+                    owner_id,
+                    group_name,
+                    1 if req.replace_group else 0,
+                    now,
+                    config_id,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT
+                  id, enabled, combo, rules, lookback_days,
+                  with_name, exclude_st, price_adjust,
+                  owner_id, group_name, group_id, replace_group,
+                  last_run_at, last_trade_date, last_count, last_error,
+                  created_at, updated_at
+                FROM auto_screen_configs
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (config_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="config not found")
+        return _auto_screen_config_from_row(row)
+
+    @app.delete("/auto-screen-configs/{config_id}", response_model=dict, dependencies=[Depends(_admin_required)])
+    def delete_auto_screen_config_item(
+        config_id: str,
+        settings: Settings = Depends(_settings_dep),
+    ) -> dict[str, Any]:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            conn.execute("DELETE FROM auto_screen_configs WHERE id = ?", (config_id,))
+        return {"ok": True}
 
     def _run_auto_screen_job(
         *,
@@ -2750,55 +3090,62 @@ def create_app(*, settings: Settings) -> FastAPI:
         force: bool,
         require_enabled: bool,
         user: AuthUser | None,
+        config_id: str | None = None,
     ) -> AutoScreenRunResponse:
         backend = _backend(settings)
         with backend.connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-            row = conn.execute(
-                """
-                SELECT
-                  screen_enabled, screen_combo, screen_rules, screen_lookback_days,
-                  screen_with_name, screen_exclude_st, screen_price_adjust,
-                  screen_owner_id, screen_group_name, screen_group_id, screen_replace_group,
-                  screen_last_trade_date, screen_last_count
-                FROM auto_update_config
-                WHERE id = 1
-                LIMIT 1
-                """
-            ).fetchone()
-            if not row:
-                raise HTTPException(status_code=500, detail="auto_update_config missing")
+            rows = _fetch_auto_screen_configs(
+                conn,
+                config_ids=[config_id] if config_id else ["default"],
+                ensure_default=config_id is None,
+            )
+        if not rows:
+            raise HTTPException(status_code=404, detail="auto screen config missing")
 
-            enabled = bool(int(row["screen_enabled"] or 0))
-            if require_enabled and not enabled:
-                raise HTTPException(status_code=400, detail="auto screen is disabled")
+        row = rows[0]
+        config_id_value = str(row.get("id") or (config_id or "default"))
+        enabled = bool(int(row.get("enabled") or 0))
+        if require_enabled and not enabled:
+            raise HTTPException(status_code=400, detail="auto screen is disabled")
 
-            owner_id = _resolve_auto_screen_owner_id(conn, user=user)
-            if user is not None and app.state.app_state.auth_enabled:
-                prev_owner_id = str(row["screen_owner_id"]) if row["screen_owner_id"] else None
-                if prev_owner_id != owner_id:
-                    conn.execute("UPDATE auto_update_config SET screen_group_id = NULL WHERE id = 1")
-                    row = dict(row)
-                    row["screen_group_id"] = None
-                conn.execute("UPDATE auto_update_config SET screen_owner_id = ? WHERE id = 1", (owner_id,))
+        owner_id = str(row.get("owner_id")) if row.get("owner_id") else None
+        now = int(time.time())
+        reset_group = False
+        if user is not None and app.state.app_state.auth_enabled:
+            if owner_id != user.id:
+                owner_id = user.id
+                reset_group = True
+        if owner_id is None:
+            with backend.connect() as conn:
+                owner_id = _resolve_auto_screen_owner_id(conn, user=user)
+                reset_group = True
+        if reset_group:
+            with backend.connect() as conn:
+                _update_auto_screen_owner(conn, config_id=config_id_value, owner_id=owner_id, reset_group=True, now=now)
+            row["group_id"] = None
+        elif owner_id and str(row.get("owner_id") or "") != owner_id:
+            with backend.connect() as conn:
+                _update_auto_screen_owner(conn, config_id=config_id_value, owner_id=owner_id, reset_group=False, now=now)
 
-            combo = str(row["screen_combo"] or "and").strip().lower()
-            if combo not in {"and", "or"}:
-                combo = "and"
-            price_adjust = str(row["screen_price_adjust"] or "qfq").strip().lower()
-            if price_adjust not in {"none", "qfq", "hfq"}:
-                price_adjust = "qfq"
-            lookback_days = int(row["screen_lookback_days"] or 200)
-            if lookback_days < 0:
-                lookback_days = 200
-            rules = str(row["screen_rules"]).strip() if row["screen_rules"] and str(row["screen_rules"]).strip() else None
-            with_name = bool(int(row["screen_with_name"] or 0))
-            exclude_st = bool(int(row["screen_exclude_st"] or 0))
-            base_group_name = _normalize_watchlist_group_name(str(row["screen_group_name"] or "自动筛选")) or "自动筛选"
-            existing_group_id = str(row["screen_group_id"]) if row["screen_group_id"] else None
-            replace_group = bool(int(row["screen_replace_group"] or 0))
-            last_trade_date = str(row["screen_last_trade_date"]) if row["screen_last_trade_date"] else None
-            last_count = int(row["screen_last_count"]) if row["screen_last_count"] is not None else None
+        combo = str(row.get("combo") or "and").strip().lower()
+        if combo not in {"and", "or"}:
+            combo = "and"
+        price_adjust = str(row.get("price_adjust") or "qfq").strip().lower()
+        if price_adjust not in {"none", "qfq", "hfq"}:
+            price_adjust = "qfq"
+        lookback_days = int(row.get("lookback_days") or 200)
+        if lookback_days < 0:
+            lookback_days = 200
+        rules = str(row.get("rules")).strip() if row.get("rules") and str(row.get("rules")).strip() else None
+        with_name = bool(int(row.get("with_name") or 0))
+        exclude_st = bool(int(row.get("exclude_st") or 0))
+        base_group_name = _normalize_watchlist_group_name(str(row.get("group_name") or "自动筛选")) or "自动筛选"
+        existing_group_id = str(row.get("group_id")) if row.get("group_id") else None
+        replace_group = bool(int(row.get("replace_group") or 0))
+        last_trade_date = str(row.get("last_trade_date")) if row.get("last_trade_date") else None
+        last_count = int(row.get("last_count")) if row.get("last_count") is not None else None
+        last_run_at = int(row.get("last_run_at")) if row.get("last_run_at") is not None else None
+        last_error = str(row.get("last_error")) if row.get("last_error") else None
 
         eff_settings = settings.model_copy(update={"price_adjust": price_adjust})
         eff_backend = _backend(eff_settings)
@@ -2821,12 +3168,17 @@ def create_app(*, settings: Settings) -> FastAPI:
         if not force and last_trade_date == trade_date:
             if existing_group_id is None:
                 with backend.connect() as conn:
-                    conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
                     gid = _ensure_auto_screen_group(conn, owner_id=owner_id, group_name=group_name, group_id=None)
                     now = int(time.time())
-                    conn.execute(
-                        "UPDATE auto_update_config SET screen_group_id = ?, updated_at = ? WHERE id = 1",
-                        (gid, now),
+                    _update_auto_screen_status(
+                        conn,
+                        config_id=config_id_value,
+                        group_id=gid,
+                        last_run_at=last_run_at,
+                        last_trade_date=last_trade_date,
+                        last_count=last_count,
+                        last_error=last_error,
+                        now=now,
                     )
                 existing_group_id = gid
             return AutoScreenRunResponse(
@@ -2865,8 +3217,6 @@ def create_app(*, settings: Settings) -> FastAPI:
 
         now = int(time.time())
         with backend.connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-
             group_id = _ensure_auto_screen_group(conn, owner_id=owner_id, group_name=group_name, group_id=existing_group_id)
             if replace_group:
                 conn.execute(
@@ -2912,18 +3262,15 @@ def create_app(*, settings: Settings) -> FastAPI:
                 (now, owner_id, group_id),
             )
 
-            conn.execute(
-                """
-                UPDATE auto_update_config
-                SET screen_group_id = ?,
-                    screen_last_run_at = ?,
-                    screen_last_trade_date = ?,
-                    screen_last_count = ?,
-                    screen_last_error = NULL,
-                    updated_at = ?
-                WHERE id = 1
-                """,
-                (group_id, now, trade_date, len(hits), now),
+            _update_auto_screen_status(
+                conn,
+                config_id=config_id_value,
+                group_id=group_id,
+                last_run_at=now,
+                last_trade_date=trade_date,
+                last_count=len(hits),
+                last_error=None,
+                now=now,
             )
 
         return AutoScreenRunResponse(
@@ -2934,6 +3281,38 @@ def create_app(*, settings: Settings) -> FastAPI:
             group_name=group_name,
             message=f"screened {len(hits)} stocks into '{group_name}'",
         )
+
+    def _run_auto_screen_jobs(*, settings: Settings, target_date: str, user: AuthUser | None) -> None:
+        backend = _backend(settings)
+        with backend.connect() as conn:
+            rows = _fetch_auto_screen_configs(conn, enabled_only=True)
+        if not rows:
+            return
+        for row in rows:
+            config_id = str(row.get("id") or "default")
+            try:
+                _run_auto_screen_job(
+                    settings=settings,
+                    target_date=target_date,
+                    force=False,
+                    require_enabled=True,
+                    user=user,
+                    config_id=config_id,
+                )
+            except Exception as e:
+                msg = (str(e) or "auto screen failed")[:2000]
+                now = int(time.time())
+                with backend.connect() as conn:
+                    _update_auto_screen_status(
+                        conn,
+                        config_id=config_id,
+                        group_id=str(row.get("group_id")) if row.get("group_id") else None,
+                        last_run_at=int(row.get("last_run_at")) if row.get("last_run_at") is not None else None,
+                        last_trade_date=str(row.get("last_trade_date")) if row.get("last_trade_date") else None,
+                        last_count=int(row.get("last_count")) if row.get("last_count") is not None else None,
+                        last_error=msg,
+                        now=now,
+                    )
 
     @app.post("/v1/auto-screen/run", response_model=AutoScreenRunResponse)
     def run_auto_screen(
@@ -2948,6 +3327,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                 force=bool(req.force),
                 require_enabled=False,
                 user=user,
+                config_id=req.config_id,
             )
         except HTTPException as e:
             # Record failure for diagnostics; then bubble up for the UI to show.
@@ -2955,18 +3335,16 @@ def create_app(*, settings: Settings) -> FastAPI:
             now = int(time.time())
             msg = (str(e.detail) if isinstance(e.detail, str) else str(e.detail or "auto screen failed"))[:2000]
             with backend.connect() as conn:
-                conn.execute("INSERT OR IGNORE INTO auto_update_config (id) VALUES (1)")
-                conn.execute(
-                    """
-                    UPDATE auto_update_config
-                    SET screen_last_run_at = ?,
-                        screen_last_trade_date = ?,
-                        screen_last_count = ?,
-                        screen_last_error = ?,
-                        updated_at = ?
-                    WHERE id = 1
-                    """,
-                    (now, None, 0, msg, now),
+                config_id = req.config_id or "default"
+                _update_auto_screen_status(
+                    conn,
+                    config_id=config_id,
+                    group_id=None,
+                    last_run_at=now,
+                    last_trade_date=None,
+                    last_count=0,
+                    last_error=msg,
+                    now=now,
                 )
             raise
 

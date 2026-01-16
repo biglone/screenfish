@@ -221,6 +221,31 @@ class SqliteBackend:
                 INSERT OR IGNORE INTO auto_update_config
                   (id, enabled, interval_seconds, provider, repair_days, updated_at)
                 VALUES (1, 0, 600, 'baostock', 30, 0);
+
+                CREATE TABLE IF NOT EXISTS auto_screen_configs (
+                  id TEXT PRIMARY KEY,
+                  enabled INTEGER NOT NULL DEFAULT 0,
+                  combo TEXT NOT NULL DEFAULT 'and',
+                  rules TEXT,
+                  lookback_days INTEGER NOT NULL DEFAULT 200,
+                  with_name INTEGER NOT NULL DEFAULT 0,
+                  exclude_st INTEGER NOT NULL DEFAULT 0,
+                  price_adjust TEXT NOT NULL DEFAULT 'qfq',
+                  owner_id TEXT,
+                  group_name TEXT NOT NULL DEFAULT '自动筛选',
+                  group_id TEXT,
+                  replace_group INTEGER NOT NULL DEFAULT 1,
+                  last_run_at INTEGER,
+                  last_trade_date TEXT,
+                  last_count INTEGER,
+                  last_error TEXT,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_auto_screen_configs_enabled
+                  ON auto_screen_configs (enabled);
+                CREATE INDEX IF NOT EXISTS idx_auto_screen_configs_owner
+                  ON auto_screen_configs (owner_id);
                 """
             )
             self._migrate(conn)
@@ -231,6 +256,13 @@ class SqliteBackend:
         def _has_column(table: str, column: str) -> bool:
             rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
             return any(r["name"] == column for r in rows)
+
+        def _has_table(table: str) -> bool:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            return row is not None
 
         # Auto update config: add run-state columns for older DBs.
         if not _has_column("auto_update_config", "run_status"):
@@ -364,6 +396,100 @@ class SqliteBackend:
             conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_last_count INTEGER")
         if _has_column("auto_update_config", "id") and not _has_column("auto_update_config", "screen_last_error"):
             conn.execute("ALTER TABLE auto_update_config ADD COLUMN screen_last_error TEXT")
+
+        if not _has_table("auto_screen_configs"):
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS auto_screen_configs (
+                  id TEXT PRIMARY KEY,
+                  enabled INTEGER NOT NULL DEFAULT 0,
+                  combo TEXT NOT NULL DEFAULT 'and',
+                  rules TEXT,
+                  lookback_days INTEGER NOT NULL DEFAULT 200,
+                  with_name INTEGER NOT NULL DEFAULT 0,
+                  exclude_st INTEGER NOT NULL DEFAULT 0,
+                  price_adjust TEXT NOT NULL DEFAULT 'qfq',
+                  owner_id TEXT,
+                  group_name TEXT NOT NULL DEFAULT '自动筛选',
+                  group_id TEXT,
+                  replace_group INTEGER NOT NULL DEFAULT 1,
+                  last_run_at INTEGER,
+                  last_trade_date TEXT,
+                  last_count INTEGER,
+                  last_error TEXT,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_auto_screen_configs_enabled
+                  ON auto_screen_configs (enabled);
+                CREATE INDEX IF NOT EXISTS idx_auto_screen_configs_owner
+                  ON auto_screen_configs (owner_id);
+                """
+            )
+
+        try:
+            row = conn.execute("SELECT COUNT(*) AS n FROM auto_screen_configs").fetchone()
+            if row and int(row["n"] or 0) == 0:
+                legacy = conn.execute(
+                    """
+                    SELECT
+                      screen_enabled, screen_combo, screen_rules, screen_lookback_days,
+                      screen_with_name, screen_exclude_st, screen_price_adjust,
+                      screen_owner_id, screen_group_name, screen_group_id, screen_replace_group,
+                      screen_last_run_at, screen_last_trade_date, screen_last_count, screen_last_error
+                    FROM auto_update_config
+                    WHERE id = 1
+                    LIMIT 1
+                    """
+                ).fetchone()
+                now = int(datetime.now(timezone.utc).timestamp())
+                if legacy:
+                    conn.execute(
+                        """
+                        INSERT INTO auto_screen_configs (
+                          id, enabled, combo, rules, lookback_days, with_name, exclude_st,
+                          price_adjust, owner_id, group_name, group_id, replace_group,
+                          last_run_at, last_trade_date, last_count, last_error,
+                          created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "default",
+                            int(legacy["screen_enabled"] or 0),
+                            legacy["screen_combo"] or "and",
+                            legacy["screen_rules"],
+                            int(legacy["screen_lookback_days"] or 200),
+                            int(legacy["screen_with_name"] or 0),
+                            int(legacy["screen_exclude_st"] or 0),
+                            legacy["screen_price_adjust"] or "qfq",
+                            legacy["screen_owner_id"],
+                            legacy["screen_group_name"] or "自动筛选",
+                            legacy["screen_group_id"],
+                            int(legacy["screen_replace_group"] or 1),
+                            legacy["screen_last_run_at"],
+                            legacy["screen_last_trade_date"],
+                            legacy["screen_last_count"],
+                            legacy["screen_last_error"],
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO auto_screen_configs (
+                          id, enabled, combo, rules, lookback_days, with_name, exclude_st,
+                          price_adjust, owner_id, group_name, group_id, replace_group,
+                          last_run_at, last_trade_date, last_count, last_error,
+                          created_at, updated_at
+                        )
+                        VALUES (?, 0, 'and', NULL, 200, 0, 0, 'qfq', NULL, '自动筛选', NULL, 1, NULL, NULL, NULL, NULL, ?, ?)
+                        """,
+                        ("default", now, now),
+                    )
+        except sqlite3.OperationalError:
+            pass
 
         try:
             from stock_screener.pinyin import pinyin_full as _pinyin_full
