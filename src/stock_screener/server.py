@@ -792,6 +792,25 @@ def create_app(*, settings: Settings) -> FastAPI:
     def _normalize_watchlist_group_name(name: str) -> str:
         return re.sub(r"\s+", " ", str(name or "").strip())[:30]
 
+    def _format_group_date_suffix(trade_date: str) -> str:
+        value = str(trade_date or "").strip()
+        if len(value) == 8 and value.isdigit():
+            return f"{value[:4]}-{value[4:6]}-{value[6:]}"
+        return value
+
+    def _auto_screen_group_name(base_name: str, trade_date: str) -> str:
+        base = _normalize_watchlist_group_name(base_name) or "自动筛选"
+        suffix_raw = str(trade_date or "").strip()
+        suffix = _format_group_date_suffix(trade_date)
+        if base.endswith(f"-{suffix}") or base.endswith(f"-{suffix_raw}"):
+            return base
+        candidate = f"{base}-{suffix}"
+        if len(candidate) <= 30:
+            return candidate
+        trim_len = max(1, 30 - len(suffix) - 1)
+        trimmed_base = base[:trim_len]
+        return f"{trimmed_base}-{suffix}"
+
     def _ensure_default_watchlist_group(conn: Any, owner_id: str) -> None:
         row = conn.execute(
             "SELECT 1 FROM watchlist_groups WHERE owner_id = ? LIMIT 1",
@@ -2775,7 +2794,7 @@ def create_app(*, settings: Settings) -> FastAPI:
             rules = str(row["screen_rules"]).strip() if row["screen_rules"] and str(row["screen_rules"]).strip() else None
             with_name = bool(int(row["screen_with_name"] or 0))
             exclude_st = bool(int(row["screen_exclude_st"] or 0))
-            group_name = _normalize_watchlist_group_name(str(row["screen_group_name"] or "自动筛选")) or "自动筛选"
+            base_group_name = _normalize_watchlist_group_name(str(row["screen_group_name"] or "自动筛选")) or "自动筛选"
             existing_group_id = str(row["screen_group_id"]) if row["screen_group_id"] else None
             replace_group = bool(int(row["screen_replace_group"] or 0))
             last_trade_date = str(row["screen_last_trade_date"]) if row["screen_last_trade_date"] else None
@@ -2794,6 +2813,8 @@ def create_app(*, settings: Settings) -> FastAPI:
                 parse_yyyymmdd(trade_date)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
+
+        group_name = _auto_screen_group_name(base_group_name, trade_date)
 
         if not force and last_trade_date == trade_date:
             if existing_group_id is None:
