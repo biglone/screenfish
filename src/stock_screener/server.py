@@ -3164,6 +3164,15 @@ def create_app(*, settings: Settings) -> FastAPI:
         group_name = _auto_screen_group_name(base_group_name, trade_date)
         if last_trade_date != trade_date:
             existing_group_id = None
+        if existing_group_id:
+            with backend.connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM watchlist_groups WHERE owner_id = ? AND id = ? LIMIT 1",
+                    (owner_id, existing_group_id),
+                ).fetchone()
+            if not row:
+                existing_group_id = None
+                last_trade_date = None
 
         if not force and last_trade_date == trade_date:
             if existing_group_id is None:
