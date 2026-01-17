@@ -56,7 +56,38 @@ def run_screen(
     )
     backend.init()
 
-    start = subtract_calendar_days(date, lookback_days)
+    if lookback_days <= 0:
+        start = date
+    else:
+        with backend.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT trade_date
+                FROM {backend.update_log_table}
+                WHERE trade_date <= ?
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                (date, int(lookback_days)),
+            ).fetchall()
+            trade_dates = [str(r["trade_date"]) for r in rows if r["trade_date"]]
+            if not trade_dates:
+                rows = conn.execute(
+                    f"""
+                    SELECT trade_date
+                    FROM {backend.daily_table}
+                    WHERE trade_date <= ?
+                    GROUP BY trade_date
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                    """,
+                    (date, int(lookback_days)),
+                ).fetchall()
+                trade_dates = [str(r["trade_date"]) for r in rows if r["trade_date"]]
+        if trade_dates:
+            start = trade_dates[-1]
+        else:
+            start = subtract_calendar_days(date, lookback_days)
     df = backend.load_daily_lookback(end=date, start=start)
     if df.empty:
         raise typer.BadParameter(f"no local data in cache for [{start}, {date}]")
