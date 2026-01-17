@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 import pandas as pd
+from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
 from stock_screener import indicators as ind
 
@@ -61,6 +62,7 @@ class FormulaOutput:
 
 class FormulaParser:
     """通达信公式解析器"""
+    FLOAT_EPS = 1e-6
 
     # 参数位置（0-based）需要为整数常量（N、M 等）
     INT_PARAMS: dict[str, set[int]] = {
@@ -312,18 +314,20 @@ class FormulaParser:
                 if len(parts) == 2:
                     left = self._eval_expr(parts[0], ctx)
                     right = self._eval_expr(parts[1], ctx)
+                    use_eps = self._is_numeric_series(left) and self._is_numeric_series(right)
+                    eps = self.FLOAT_EPS
                     if op == '>=':
-                        return left >= right
+                        return left >= (right - eps) if use_eps else left >= right
                     elif op == '<=':
-                        return left <= right
+                        return left <= (right + eps) if use_eps else left <= right
                     elif op == '<>':
-                        return left != right
+                        return (left - right).abs() > eps if use_eps else left != right
                     elif op == '>':
-                        return left > right
+                        return left > (right - eps) if use_eps else left > right
                     elif op == '<':
-                        return left < right
+                        return left < (right + eps) if use_eps else left < right
                     elif op == '=':
-                        return left == right
+                        return (left - right).abs() <= eps if use_eps else left == right
 
         # 处理加减运算符
         if self._has_operator(expr, '+') or self._has_operator(expr, '-'):
@@ -460,6 +464,13 @@ class FormulaParser:
                 last_idx = i
 
         return last_idx
+
+    def _is_numeric_series(self, series: pd.Series) -> bool:
+        if not isinstance(series, pd.Series):
+            return False
+        if is_bool_dtype(series.dtype):
+            return False
+        return is_numeric_dtype(series.dtype)
 
     def _series_from_scalar(self, value: Any, ctx: FormulaContext) -> pd.Series:
         if isinstance(value, pd.Series):
