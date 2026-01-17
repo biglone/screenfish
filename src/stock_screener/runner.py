@@ -59,6 +59,7 @@ def run_screen(
     if lookback_days <= 0:
         start = date
     else:
+        trade_dates: list[str] = []
         with backend.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -88,6 +89,7 @@ def run_screen(
             start = trade_dates[-1]
         else:
             start = subtract_calendar_days(date, lookback_days)
+
     df = backend.load_daily_lookback(end=date, start=start)
     if df.empty:
         raise typer.BadParameter(f"no local data in cache for [{start}, {date}]")
@@ -98,6 +100,8 @@ def run_screen(
     df = df.loc[df["vol"].notna() & df["amount"].notna() & ~((df["vol"] == 0) & (df["amount"] == 0))].reset_index(
         drop=True
     )
+    if lookback_days > 0:
+        df = df.groupby("ts_code", sort=False).tail(lookback_days).reset_index(drop=True)
 
     try:
         rule_objs = resolve_rules(rules, backend=backend)
