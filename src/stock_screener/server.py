@@ -1131,11 +1131,12 @@ def create_app(*, settings: Settings) -> FastAPI:
                                     (now2, now2, latest, now2),
                                 )
 
-                                if latest:
-                                    try:
-                                        _run_auto_screen_jobs(settings=settings, target_date=latest, user=None)
-                                    except Exception:
-                                        pass
+                            if latest:
+                                # Run after committing auto-update status to avoid SQLite write locks.
+                                try:
+                                    _run_auto_screen_jobs(settings=settings, target_date=latest, user=None)
+                                except Exception:
+                                    pass
                             break
 
                         if provider == "baostock" and target_end:
