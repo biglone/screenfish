@@ -145,6 +145,37 @@ def _tail_journald_user_unit(unit: str, *, max_lines: int) -> list[str]:
     return (res.stdout or "").splitlines()
 
 
+def _is_provider_index_error(err: Exception) -> bool:
+    msg = str(err or "").strip().lower()
+    return "list index out of range" in msg or "index out of range" in msg or "indexerror" in msg
+
+
+def _open_trade_dates_with_retry(
+    *,
+    provider: Literal["baostock", "tushare"],
+    start: str,
+    end: str,
+    attempts: int = 3,
+) -> list[str]:
+    last_err: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            p = get_provider(provider)
+            return p.open_trade_dates(start=start, end=end)
+        except (TuShareNotConfigured, BaoStockNotConfigured, TuShareTokenMissing, ValueError) as e:
+            raise ValueError(str(e)) from e
+        except Exception as e:  # pragma: no cover
+            last_err = e
+            if not _is_provider_index_error(e) or attempt >= attempts:
+                break
+            time.sleep(float(attempt))
+    if last_err is None:
+        return []
+    if _is_provider_index_error(last_err):
+        raise ValueError("provider returned invalid data; please retry later") from last_err
+    raise ValueError(str(last_err)) from last_err
+
+
 def resolve_wait_target_trade_date(
     *,
     provider: Literal["baostock", "tushare"],
@@ -155,13 +186,7 @@ def resolve_wait_target_trade_date(
     if lookback_days < 0:
         raise ValueError("lookback_days must be >= 0")
     start = subtract_calendar_days(target_date, lookback_days)
-    try:
-        p = get_provider(provider)
-        open_dates = p.open_trade_dates(start=start, end=target_date)
-    except (TuShareNotConfigured, BaoStockNotConfigured, TuShareTokenMissing, ValueError) as e:
-        raise ValueError(str(e)) from e
-    except Exception as e:  # pragma: no cover
-        raise ValueError(str(e)) from e
+    open_dates = _open_trade_dates_with_retry(provider=provider, start=start, end=target_date)
     if not open_dates:
         raise ValueError(f"no open trade dates found for {provider} in {start}..{target_date}")
     return str(open_dates[-1])
@@ -3589,12 +3614,13 @@ def create_app(*, settings: Settings) -> FastAPI:
 
         range_start = subtract_calendar_days(target_date, lookback_days)
         try:
-            p = get_provider(provider)
-            open_dates = [str(x) for x in p.open_trade_dates(start=range_start, end=target_date)]
-        except (TuShareNotConfigured, BaoStockNotConfigured, TuShareTokenMissing, ValueError) as e:
+            open_dates = [str(x) for x in _open_trade_dates_with_retry(
+                provider=provider,
+                start=range_start,
+                end=target_date,
+            )]
+        except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        except Exception as e:  # pragma: no cover
-            raise HTTPException(status_code=500, detail=str(e)) from e
 
         updated_dates = backend.get_updated_trade_dates(open_dates)
         missing_update_log_dates = [d for d in open_dates if d not in updated_dates]
