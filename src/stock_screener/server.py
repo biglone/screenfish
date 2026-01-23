@@ -60,7 +60,7 @@ from stock_screener.runner import run_screen
 from stock_screener.tdx import TdxEbkFormat, ts_code_to_ebk_code
 from stock_screener.tushare_client import TuShareNotConfigured
 from stock_screener.update import UpdateBadRequest, UpdateIncomplete, UpdateNotConfigured
-from stock_screener.update import update_daily_all_service, update_daily_service
+from stock_screener.update import repair_bj_daily, update_daily_all_service, update_daily_service
 
 
 def _client_ip(request: Request) -> str | None:
@@ -823,6 +823,47 @@ def create_app(*, settings: Settings) -> FastAPI:
     update_wait_jobs: dict[str, _UpdateWaitJob] = {}
     update_wait_jobs_lock = threading.Lock()
     update_lock = threading.Lock()
+    bj_repair_lock = threading.Lock()
+    bj_repair_last_at = 0.0
+    bj_repair_min_interval = 10.0 * 60.0
+
+    def _latest_update_log_trade_date() -> str | None:
+        backend = _backend(settings)
+        latests: list[str] = []
+        with backend.connect() as conn:
+            for table in ("update_log", "update_log_qfq", "update_log_hfq"):
+                try:
+                    row = conn.execute(f"SELECT MAX(trade_date) AS d FROM {table}").fetchone()
+                except sqlite3.OperationalError:
+                    continue
+                if row and row["d"] is not None:
+                    latests.append(str(row["d"]))
+        return max(latests) if latests else None
+
+    def _repair_bj_if_needed(trade_date: str | None) -> None:
+        nonlocal bj_repair_last_at
+        if not trade_date:
+            return
+        now = time.time()
+        if now - bj_repair_last_at < bj_repair_min_interval:
+            return
+        if not bj_repair_lock.acquire(False):
+            return
+        try:
+            if not update_lock.acquire(timeout=1.0):
+                return
+            try:
+                for mode in ("none", "qfq", "hfq"):
+                    mode_settings = settings.model_copy(update={"price_adjust": mode})
+                    try:
+                        repair_bj_daily(settings=mode_settings, trade_date=trade_date, attempts=2, max_codes=500)
+                    except Exception:
+                        pass
+            finally:
+                update_lock.release()
+            bj_repair_last_at = now
+        finally:
+            bj_repair_lock.release()
 
     def _normalize_watchlist_group_name(name: str) -> str:
         return re.sub(r"\s+", " ", str(name or "").strip())[:30]
@@ -1162,12 +1203,14 @@ def create_app(*, settings: Settings) -> FastAPI:
                                     _run_auto_screen_jobs(settings=settings, target_date=latest, user=None)
                                 except Exception:
                                     pass
+                                _repair_bj_if_needed(latest)
                             break
 
                         if provider == "baostock" and target_end:
                             ok_remote, detail = probe_baostock_daily_available(trade_date=target_end)
                             if not ok_remote:
                                 _run_progress(None, f"waiting for provider publish ({detail})")
+                                _repair_bj_if_needed(_latest_update_log_trade_date())
                                 stop_event.wait(publish_probe_interval)
                                 continue
 
@@ -1513,6 +1556,7 @@ def create_app(*, settings: Settings) -> FastAPI:
                         job.mode_completed = None
                         job.mode_total = None
                         job.progress = None
+                    _repair_bj_if_needed(_latest_update_log_trade_date())
                     remaining = timeout_seconds - (time.time() - started_at)
                     sleep_for = max(0.0, min(float(interval_seconds), float(remaining)))
                     if sleep_for <= 0:

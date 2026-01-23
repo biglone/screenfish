@@ -45,6 +45,109 @@ def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     return [values[i : i + batch_size] for i in range(0, len(values), batch_size)]
 
 
+def _bj_missing_trade_date_codes(
+    *,
+    conn: sqlite3.Connection,
+    daily_table: str,
+    trade_date: str,
+) -> list[str]:
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT ts_code
+            FROM stock_basic
+            WHERE ts_code LIKE '%.BJ'
+              AND ts_code NOT IN (
+                SELECT ts_code
+                FROM {daily_table}
+                WHERE trade_date = ?
+                  AND ts_code LIKE '%.BJ'
+              )
+            """,
+            (trade_date,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    missing = {str(r["ts_code"]) for r in rows if r and r["ts_code"]}
+    return sorted(missing)
+
+
+def repair_bj_daily(
+    *,
+    settings: Settings,
+    trade_date: str,
+    attempts: int = 2,
+    max_codes: int | None = None,
+) -> int:
+    parse_yyyymmdd(trade_date)
+    backend = SqliteBackend(
+        settings.sqlite_path,
+        daily_table=settings.daily_table,
+        update_log_table=settings.update_log_table,
+        provider_stock_progress_table=settings.provider_stock_progress_table,
+    )
+    backend.init()
+
+    with backend.connect() as conn:
+        missing = _bj_missing_trade_date_codes(conn=conn, daily_table=backend.daily_table, trade_date=trade_date)
+
+    if not missing:
+        return 0
+
+    if max_codes is not None and max_codes > 0:
+        missing = missing[:max_codes]
+
+    provider = EastmoneyProvider()
+    adjust = settings.price_adjust if settings.price_adjust in {"none", "qfq", "hfq"} else "none"
+    updated = 0
+    pending = list(missing)
+    basics: list[dict[str, str]] = []
+
+    for attempt in range(1, max(1, attempts) + 1):
+        next_pending: list[str] = []
+        for ts_code in pending:
+            try:
+                df, name = provider.fetch_daily(
+                    ts_code=ts_code,
+                    start=trade_date,
+                    end=trade_date,
+                    adjust=adjust,  # type: ignore[arg-type]
+                )
+            except Exception as e:
+                typer.echo(f"warning: eastmoney update failed for {ts_code}: {e}", err=True)
+                next_pending.append(ts_code)
+                continue
+            if df is None or df.empty:
+                next_pending.append(ts_code)
+            else:
+                with backend.connect() as conn:
+                    backend.upsert_daily_df_in_conn(conn, df)
+                updated += len(df)
+            if name:
+                basics.append({"ts_code": ts_code, "name": name})
+
+        if basics:
+            with backend.connect() as conn:
+                backend.upsert_stock_basic_df_in_conn(conn, pd.DataFrame(basics).drop_duplicates(subset=["ts_code"]))
+            basics = []
+
+        if not next_pending:
+            pending = []
+            break
+
+        pending = next_pending
+        if attempt < attempts:
+            time.sleep(1.0 * (2**(attempt - 1)))
+
+    if pending:
+        typer.echo(
+            f"warning: eastmoney BJ backfill incomplete for {trade_date} (remaining {len(pending)})",
+            err=True,
+        )
+
+    return updated
+
+
 def _resolve_start_end(
     *,
     backend: SqliteBackend,
